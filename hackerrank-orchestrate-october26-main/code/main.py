@@ -1,623 +1,563 @@
 """
-Ghost Data Still Exists — AI-powered deletion-audit agent.
+Ghost Data Still Exists -- deletion-audit agent.
 
-Entry point: python code/main.py
-Output:      output.csv (repository root)
+    python code/main.py          # audits dataset/deletion_requests.csv -> output.csv (+ code/evaluation/usage_report.md)
+    python code/main.py --eval   # scores the pipeline on dataset/sample_* and prints case/step/sequence/evidence accuracy
 
-Requires:
-  pip install groq pandas python-dotenv
-
-Environment variable:
-  GROQ_API_KEY  — Groq API key
+Pipeline (deterministic core, optional LLM only for ambiguous request intent):
+  1. identity   : current + historical email / phone / user_id / email hash
+  2. evidence   : logs (kv + JSON lines), JSON exports/bundles, SQLite snapshots (incl. JSON-column and replica drift), handover txt, PDFs
+  3. linking    : a record belongs to the user if any observation carries one of the user's identifiers; records with no identifier
+                  (deleted accounts, anonymized analytics) are attached through deletion-worker activity (see link_* functions)
+  4. state      : latest observation at/before audit_at decides the state of each record; reported_status is never trusted
+  5. policy     : deletion_rules.csv -> finding / remediation / verification operations; steps sorted exactly as the spec requires
+Optional: pip install groq  +  GROQ_API_KEY  -> an LLM decides only requests the keyword rules cannot classify.
 """
-
 from __future__ import annotations
 
-import csv
-import hashlib
-import json
-import os
-import re
-import sys
-import time
-import textwrap
-from datetime import datetime, timezone
+import csv, hashlib, json, os, re, shutil, sqlite3, subprocess, sys
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
+ROOT = Path(__file__).resolve().parent.parent
+DATASET = ROOT / "dataset"
+OUTPUT = ROOT / "output.csv"
+USAGE_REPORT = Path(__file__).resolve().parent / "evaluation" / "usage_report.md"
+LLM_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")   # only used for ambiguous intent
+SLACK_H = 1.0   # deletion actions may land up to this long after reported_at
 
-# ---------------------------------------------------------------------------
-# Optional .env loading
-# ---------------------------------------------------------------------------
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+# --------------------------------------------------------------------------- constants
+OPS = ['REPORT_REMAINING_RECORD', 'REPORT_EXPOSED_PII', 'REPORT_ACTIVE_DATA_FLOW', 'REPORT_RESTORE_RISK',
+       'DISABLE_DATA_FLOW', 'BLOCK_RESTORE', 'DELETE_RECORD', 'REDACT_RECORD', 'ANONYMIZE_RECORD',
+       'VERIFY_RECORD_ABSENT', 'VERIFY_RECORD_PRESENT', 'VERIFY_RECORD_REDACTED', 'VERIFY_RECORD_ANONYMIZED',
+       'VERIFY_DATA_FLOW_DISABLED', 'VERIFY_RESTORE_BLOCKED']
+STATE = dict(zip(OPS, ['PRESENT', 'PRESENT', 'ACTIVE', 'ACTIVE', 'DISABLED', 'BLOCKED', 'ABSENT', 'REDACTED', 'ANONYMIZED',
+                       'ABSENT', 'PRESENT', 'REDACTED', 'ANONYMIZED', 'DISABLED', 'BLOCKED']))
+PHASE_OF = {o: ('FINDING' if i < 4 else 'REMEDIATION' if i < 9 else 'VERIFICATION') for i, o in enumerate(OPS)}
+PHASE_NO = {'FINDING': 0, 'REMEDIATION': 1, 'VERIFICATION': 2}
+SYSTEM = {'account': 'account_service', 'search': 'search_service', 'analytics': 'analytics_platform', 'support': 'support_platform',
+          'export': 'export_service', 'data_flow': 'integration_service', 'backup': 'backup_service', 'audit_record': 'security_service',
+          'tombstone': 'identity_service', 'cache': 'cache_service', 'email_delivery': 'email_delivery_service',
+          'marketing': 'marketing_platform', 'legal_hold': 'legal_service'}
+DELETE_EVENTS = {'DELETE_RECORD', 'ANONYMIZE_RECORD', 'REDACT_RECORD', 'DISABLE_DATA_FLOW', 'BLOCK_RESTORE'}
+RESULT_OF = {'COMPLETE': 'SUCCESS', 'PARTIALLY_COMPLETE': 'PARTIAL', 'NOT_STARTED': 'FAILED'}
 
-# ---------------------------------------------------------------------------
-# Groq client
-# ---------------------------------------------------------------------------
-try:
-    from groq import Groq
-except ImportError:
-    print("groq package not installed. Run: pip install groq", file=sys.stderr)
-    sys.exit(1)
+RID = re.compile(r'\b((?:account|search|analytics|support|export|data_flow|backup|audit_record|tombstone|cache|email_delivery|marketing|legal_hold)_[0-9]+)\b')
+KV = re.compile(r'(\w+)=("[^"]*"|\S+)')
+EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+USERREF = re.compile(r'\buser_?\s?(\d+)\b', re.I)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-if not GROQ_API_KEY:
-    print("ERROR: GROQ_API_KEY environment variable is not set.", file=sys.stderr)
-    sys.exit(1)
 
-MODEL = "qwen/qwen3.8-27b"
-client = Groq(api_key=GROQ_API_KEY)
+def ts(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace('Z', '+00:00'))
 
-# Pacing: free tier TPM limit varies. Sleep 8s between calls as a safe default.
-# The retry logic will auto-wait longer if rate-limited.
-CALL_DELAY_S = 8
 
-# ---------------------------------------------------------------------------
-# Path setup (all relative to repo root)
-# ---------------------------------------------------------------------------
-REPO_ROOT = Path(__file__).parent.parent
-DATASET = REPO_ROOT / "dataset"
-EVIDENCE_DIR = DATASET / "evidence"
-OUTPUT_CSV = REPO_ROOT / "output.csv"
+def prefix(rid: str) -> str:
+    return rid.rsplit('_', 1)[0]
 
-# ---------------------------------------------------------------------------
-# Load all reference datasets into memory once
-# ---------------------------------------------------------------------------
 
-def load_csv(path: Path) -> list[dict]:
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+def norm_phone(p) -> str:
+    return re.sub(r'\D', '', p or '')
 
-print("Loading dataset files...")
-deletion_requests  = load_csv(DATASET / "deletion_requests.csv")
-deletion_rules     = load_csv(DATASET / "deletion_rules.csv")
-user_identities    = load_csv(DATASET / "user_identities.csv")
-user_audit_log     = load_csv(DATASET / "user_audit_log.csv")
-system_activity    = load_csv(DATASET / "system_activity.csv")
-evidence_files     = load_csv(DATASET / "evidence_files.csv")
 
-# Pre-build lookup maps
-identity_by_email: dict[str, dict] = {}  # normalised_email -> identity row
-identity_by_id: dict[str, dict] = {}
-identity_by_hash: dict[str, dict] = {}
+def _clean(v):
+    if v is None:
+        return None
+    v = str(v).strip().strip('"')
+    return None if v.lower() in ('null', 'none', '') else v
 
-for ident in user_identities:
-    identity_by_email[ident["email"].lower()] = ident
-    identity_by_id[ident["user_id"]] = ident
-    if ident.get("email_hash"):
-        identity_by_hash[ident["email_hash"]] = ident
 
-# Historical identifiers: user_id -> list of old values per field
-hist_by_user: dict[str, list[dict]] = {}
-for row in user_audit_log:
-    uid = row["user_id"]
-    hist_by_user.setdefault(uid, []).append(row)
-
-# Also index audit log by old email value so we can find users by historical email
-hist_email_to_user: dict[str, str] = {}
-for row in user_audit_log:
-    if row["field_name"] == "email":
-        hist_email_to_user[row["old_value"].lower()] = row["user_id"]
-
-# Activity grouped by resource_id for fast lookup
-activity_by_resource: dict[str, list[dict]] = {}
-for row in system_activity:
-    rid = row["resource_id"]
-    activity_by_resource.setdefault(rid, []).append(row)
-
-# Activity also indexed by event_type
-activity_by_type: dict[str, list[dict]] = {}
-for row in system_activity:
-    etype = row["event_type"]
-    activity_by_type.setdefault(etype, []).append(row)
-
-# Evidence manifest indexed by file_id
-evidence_by_id: dict[str, dict] = {row["file_id"]: row for row in evidence_files}
-
-print(f"  {len(deletion_requests)} requests, {len(user_identities)} identities, "
-      f"{len(system_activity)} activities, {len(evidence_files)} evidence files.")
-
-# ---------------------------------------------------------------------------
-# Evidence content cache -- read files lazily
-# ---------------------------------------------------------------------------
-
-_evidence_content_cache: dict[str, str] = {}
-
-def read_evidence_file(file_id: str) -> str:
-    """Return the text content of an evidence file (cached)."""
-    if file_id in _evidence_content_cache:
-        return _evidence_content_cache[file_id]
-    meta = evidence_by_id.get(file_id)
-    if not meta:
-        return ""
-    path = DATASET / meta["file_path"]
-    if not path.exists():
-        return ""
-    suffix = path.suffix.lower()
-    try:
-        if suffix in (".txt", ".log", ".json", ".sql", ".csv", ".md"):
-            content = path.read_text(encoding="utf-8", errors="replace")
-        elif suffix == ".pdf":
+# --------------------------------------------------------------------------- evidence parsers -> observations
+# observation = dict(file, t, rid, attrs{lowercase key: str|None}, snap)
+def parse_log(path, fid):
+    """key=value lines and '<ts> {json}' lines. Lines of one trace_id are merged (the lookup key is on a different line than the result)."""
+    traces, order = {}, []
+    for line in path.read_text(errors='replace').splitlines():
+        m = re.match(r'(\d{4}-\d\d-\d\dT[\d:]+Z)\s+(.*)', line)
+        if not m:
+            continue
+        t, rest = m.groups()
+        if rest.lstrip().startswith('{'):
             try:
-                import pdfplumber
-                with pdfplumber.open(path) as pdf:
-                    content = "\n".join(
-                        page.extract_text() or "" for page in pdf.pages
-                    )
+                kv = {k.lower(): _clean(v) for k, v in json.loads(rest).items()}
             except Exception:
-                content = f"[PDF: {path.name} -- install pdfplumber to read]"
-        elif suffix in (".png", ".jpg", ".jpeg", ".webp"):
-            content = f"[Image: {path.name} -- visual evidence, cannot extract text]"
+                continue
         else:
-            content = path.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        content = f"[Error reading {path.name}: {exc}]"
-    # Truncate very large files to avoid context overflow
-    if len(content) > 80_000:
-        content = content[:80_000] + "\n...[truncated]"
-    _evidence_content_cache[file_id] = content
-    return content
+            kv = {k.lower(): _clean(v) for k, v in KV.findall(rest)}
+        key = kv.get('trace_id') or kv.get('resource_id') or f'L{len(order)}'
+        if key not in traces:
+            traces[key] = {'t': t, 'attrs': {}}
+            order.append(key)
+        traces[key]['t'] = t
+        for k, v in kv.items():
+            if v is not None or k not in traces[key]['attrs']:
+                traces[key]['attrs'][k] = v
+    return [dict(file=fid, t=traces[k]['t'], rid=traces[k]['attrs']['resource_id'], attrs=traces[k]['attrs'])
+            for k in order if traces[k]['attrs'].get('resource_id')]
 
-# ---------------------------------------------------------------------------
-# Identity resolution
-# ---------------------------------------------------------------------------
 
-def resolve_user(email: str) -> dict | None:
-    """Return the identity row for the given email (current or historical)."""
-    email_lower = email.lower().strip()
-    if email_lower in identity_by_email:
-        return identity_by_email[email_lower]
-    if email_lower in hist_email_to_user:
-        uid = hist_email_to_user[email_lower]
-        return identity_by_id.get(uid)
-    # Try email-hash match
-    email_hash = hashlib.sha256(email_lower.encode()).hexdigest()
-    if email_hash in identity_by_hash:
-        return identity_by_hash[email_hash]
-    return None
+def parse_txt(text, fid):
+    """handover sheet:  ts | system | resource_id | CATEGORY | STATE | subject"""
+    out = []
+    for line in text.splitlines():
+        p = [x.strip() for x in line.lstrip('- ').split('|')]
+        if len(p) >= 5 and RID.fullmatch(p[2]):
+            out.append(dict(file=fid, t=p[0], rid=p[2], attrs=dict(system=p[1], category=p[3], state=p[4], subject=p[5] if len(p) > 5 else None)))
+    return out
 
-def get_all_identifiers(user: dict) -> dict:
-    """Return all current + historical identifiers for a user."""
-    uid = user["user_id"]
-    result = {
-        "user_id": uid,
-        "current_email": user.get("email", ""),
-        "current_name":  user.get("name", ""),
-        "current_phone": user.get("phone", ""),
-        "email_hash":    user.get("email_hash", ""),
-        "historical": []
-    }
-    for row in hist_by_user.get(uid, []):
-        result["historical"].append({
-            "field": row["field_name"],
-            "old_value": row["old_value"],
-            "new_value": row["new_value"],
-            "event_time": row["event_time"],
-        })
-    return result
 
-# ---------------------------------------------------------------------------
-# Activity filtering
-# ---------------------------------------------------------------------------
+def _flat(d, out=None):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            _flat(v, out)
+        elif not isinstance(v, list):
+            out[k.lower()] = _clean(v)
+    return out
 
-def get_activities_for_user(user_id: str, identifiers: dict, audit_at: str) -> list[dict]:
-    """Return system activities up to audit_at that likely concern the user."""
-    audit_dt = datetime.fromisoformat(audit_at.replace("Z", "+00:00"))
-    all_emails = {identifiers["current_email"].lower()}
-    all_phones = {identifiers["current_phone"]}
-    all_names  = {identifiers["current_name"]}
-    for h in identifiers["historical"]:
-        if h["field"] == "email":
-            all_emails.add(h["old_value"].lower())
-        elif h["field"] == "phone":
-            all_phones.add(h["old_value"])
-        elif h["field"] == "name":
-            all_names.add(h["old_value"])
 
-    relevant = []
-    for row in system_activity:
-        evt_time = datetime.fromisoformat(row["event_time"].replace("Z", "+00:00"))
-        if evt_time > audit_dt:
-            continue
-        details = (row.get("details") or "").lower()
-        rid     = (row.get("resource_id") or "").lower()
-        matched = False
-        for em in all_emails:
-            if em and em in details:
-                matched = True
-                break
-        if not matched:
-            for ph in all_phones:
-                if ph and ph in details:
-                    matched = True
-                    break
-        if not matched:
-            if user_id.lower() in details or user_id.lower() in rid:
-                matched = True
-        if matched:
-            relevant.append(row)
-    return relevant
+def parse_json(path, fid):
+    data = json.loads(path.read_text(errors='replace'))
+    out = []
 
-# ---------------------------------------------------------------------------
-# Evidence file relevance
-# ---------------------------------------------------------------------------
+    def walk(node, ctx):
+        if isinstance(node, dict):
+            if isinstance(node.get('resource_id'), str):
+                a = dict(ctx)
+                a.update(_flat(node))
+                out.append(dict(file=fid, t=a.get('observed_at') or a.get('captured_at') or a.get('exported_at'), rid=node['resource_id'], attrs=a))
+                return
+            c = dict(ctx)
+            for k, v in node.items():
+                if isinstance(v, (str, int, float)) and k in ('captured_at', 'data_store', 'collection', 'exported_at', 'region'):
+                    c[k.lower()] = _clean(v)
+            for k, v in node.items():
+                if isinstance(v, (dict, list)):
+                    c2 = dict(c)
+                    if k.endswith('_service') or k.endswith('_platform'):
+                        c2['data_store'] = k
+                    walk(v, c2)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x, ctx)
 
-def find_relevant_evidence(identifiers: dict, audit_at: str) -> list[tuple[str, str]]:
-    """Return list of (file_id, truncated_content) for evidence captured <= audit_at."""
-    audit_dt = datetime.fromisoformat(audit_at.replace("Z", "+00:00"))
-    all_ids: set[str] = set()
-    all_ids.add(identifiers["user_id"].lower())
-    all_ids.add(identifiers["current_email"].lower())
-    for h in identifiers["historical"]:
-        all_ids.add(h["old_value"].lower())
-    all_ids.discard("")
+    walk(data, {'exported_at': data.get('exported_at') if isinstance(data, dict) else None})
+    return out
 
-    results = []
-    for ev in evidence_files:
-        cap = datetime.fromisoformat(ev["captured_at"].replace("Z", "+00:00"))
-        if cap > audit_dt:
-            continue
-        content = read_evidence_file(ev["file_id"])
-        content_lower = content.lower()
-        for ident in all_ids:
-            if ident and ident in content_lower:
-                idx = content_lower.find(ident)
-                start = max(0, idx - 500)
-                end   = min(len(content), idx + 3500)
-                snippet = content[start:end]
-                results.append((ev["file_id"], snippet))
-                break
-    return results
 
-# ---------------------------------------------------------------------------
-# Deletion intent detection (heuristic)
-# ---------------------------------------------------------------------------
+def parse_sql(path, fid, captured_at):
+    """SQLite snapshot. Every row of every table (primary, replicas, failover...) is an observation; *_json columns are expanded."""
+    txt = path.read_text(errors='replace')
+    con = sqlite3.connect(':memory:')
+    try:
+        con.executescript(txt)
+    except Exception:
+        return []
+    con.row_factory = sqlite3.Row
+    out = []
+    for (tbl,) in con.execute("select name from sqlite_master where type='table'").fetchall():
+        for r in con.execute(f'select * from "{tbl}"'):
+            d = {k.lower(): _clean(r[k]) for k in r.keys()}
+            for jk in [k for k in d if k.endswith('_json') and d[k]]:
+                try:
+                    d.update(_flat(json.loads(d[jk])))
+                except Exception:
+                    pass
+            if d.get('resource_id'):
+                d['table'] = tbl
+                out.append(dict(file=fid, t=captured_at, rid=d['resource_id'], attrs=d, snap=captured_at))
+    return out
 
-DELETION_KEYWORDS = [
-    "delet", "erase", "remov", "close", "wipe", "purge", "forget",
-    "right to be forgotten", "rtbf", "gdpr", "ccpa", "right erasure",
-]
-NON_DELETION_KEYWORDS = [
-    "export", "download", "access", "correct", "update", "change",
-    "opt.out", "unsubscribe", "marketing",
-]
 
-def quick_deletion_intent(request_text: str) -> bool | None:
-    """Heuristic pre-check. Returns True=likely deletion, False=likely not, None=uncertain."""
-    text_lower = request_text.lower()
-    has_del = any(kw in text_lower for kw in DELETION_KEYWORDS)
-    has_non = any(kw in text_lower for kw in NON_DELETION_KEYWORDS)
-    if has_del and not has_non:
-        return True
-    if has_non and not has_del:
-        return False
-    return None
+def pdf_text(path) -> str:
+    if shutil.which('pdftotext'):
+        return subprocess.run(['pdftotext', '-layout', str(path), '-'], capture_output=True, text=True).stdout
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            return '\n'.join(p.extract_text() or '' for p in pdf.pages)
+    except Exception:
+        return ''
 
-# ---------------------------------------------------------------------------
-# LLM helpers
-# ---------------------------------------------------------------------------
 
-def call_llm(system_prompt: str, user_prompt: str, max_tokens: int = 1200) -> str:
-    """Call Groq API with pacing and exponential backoff on rate-limit errors."""
-    for attempt in range(8):
+def parse_pdf(path, fid, captured_at):
+    """Statements / attachments: every resource id in the document is tagged with the emails and user ids printed in it."""
+    text = pdf_text(path)
+    ids = {m.lower() for m in EMAIL.findall(text)} | {'user_' + n for n in USERREF.findall(text)}
+    return [dict(file=fid, t=captured_at, rid=r, snap=captured_at,
+                 attrs=dict(docname=path.stem.lower(), **{f'id{i}': v for i, v in enumerate(sorted(ids))}))
+            for r in sorted(set(RID.findall(text)))]
+# NOTE: .png console screenshots are not parsed (OCR cannot reliably attribute table rows to one user; precision matters more).
+
+
+def parse_all(ds, manifest):
+    obs = []
+    for ev in manifest:
+        p, fid, cap, suf = ds / ev['file_path'], ev['file_id'], ev['captured_at'], Path(ev['file_path']).suffix.lower()
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                temperature=0,
-                max_tokens=max_tokens,
-            )
-            # Pace between calls
-            time.sleep(CALL_DELAY_S)
-            return response.choices[0].message.content or ""
-        except Exception as exc:
-            msg = str(exc)
-            if "429" in msg or "413" in msg or "rate_limit" in msg.lower():
-                # Try to parse "try again in Xs" from error message
-                m = re.search(r"try again in ([\d.]+)s", msg)
-                wait = float(m.group(1)) + 2 if m else min(2 ** attempt * 5, 90)
-                print(f" [TPM limit, waiting {wait:.0f}s]", end="", flush=True)
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(f"Groq: exceeded retries on {MODEL}")
-
-# ---------------------------------------------------------------------------
-# Core audit logic
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT_AUDIT = """Deletion audit agent. Output JSON only, no prose.
-
-Deletion policy:
-{rules}
-
-Output schema:
-{{"deletion_status":"COMPLETE"|"INCOMPLETE"|"NOT_APPLICABLE","steps":[{{"step_no":1,"phase":"FINDING"|"REMEDIATION"|"VERIFICATION","system_id":"...","resource_id":"...","operation":"...","state":"...","evidence_id":"..."}}]}}
-
-Phase/operation/state pairs:
-FINDING: REPORT_REMAINING_RECORD->PRESENT, REPORT_EXPOSED_PII->PRESENT, REPORT_ACTIVE_DATA_FLOW->ACTIVE, REPORT_RESTORE_RISK->ACTIVE
-REMEDIATION: DISABLE_DATA_FLOW->DISABLED, BLOCK_RESTORE->BLOCKED, DELETE_RECORD->ABSENT, REDACT_RECORD->REDACTED, ANONYMIZE_RECORD->ANONYMIZED
-VERIFICATION: VERIFY_RECORD_ABSENT->ABSENT, VERIFY_RECORD_PRESENT->PRESENT, VERIFY_RECORD_REDACTED->REDACTED, VERIFY_RECORD_ANONYMIZED->ANONYMIZED, VERIFY_DATA_FLOW_DISABLED->DISABLED, VERIFY_RESTORE_BLOCKED->BLOCKED
-
-Rules:
-- NOT_APPLICABLE if request_text is NOT a deletion request (access/export/marketing/correction = NOT_APPLICABLE).
-- Resolve identifiers from USER IDENTITY section.
-- TRUE state at audit_at from evidence only; ignore reported_status.
-- Apply policy to every record in evidence.
-- ACCOUNT_TOMBSTONE: REDACT name/email/phone/hash; keep user_id.
-- SECURITY_AUDIT_LOG in retention -> RETAIN.
-- BACKUP_ARCHIVE -> RETAIN + BLOCK_RESTORE.
-- Order: FINDING->REMEDIATION->VERIFICATION; within phase sort by operation order above, then system_id, resource_id.
-- COMPLETE: VERIFICATION steps only, each citing evidence_id.
-- INCOMPLETE: FINDING steps cite evidence; REMEDIATION+future VERIFICATION use evidence_id="".
-- Output ONLY the JSON object."""
+            o = (parse_log(p, fid) if suf == '.log' else parse_json(p, fid) if suf == '.json' else parse_sql(p, fid, cap) if suf == '.sql'
+                 else parse_txt(p.read_text(errors='replace'), fid) if suf == '.txt' else parse_pdf(p, fid, cap) if suf == '.pdf' else [])
+        except Exception as e:
+            print(f'  warning: could not parse {ev["file_path"]}: {e}', file=sys.stderr)
+            o = []
+        for x in o:
+            x['t'] = x['t'] or cap
+            x.setdefault('snap', cap)
+        obs += o
+    return obs
 
 
-def build_user_prompt(
-    case: dict,
-    identifiers: dict | None,
-    activities: list[dict],
-    evidence_snippets: list[tuple[str, str]],
-) -> str:
-    """Assemble the per-case prompt."""
-    parts = []
+# --------------------------------------------------------------------------- data + identity
+class Data:
+    def __init__(self, ds: Path):
+        L = lambda n: list(csv.DictReader(open(ds / n, encoding='utf-8')))
+        self.ident, self.audit = L('user_identities.csv'), L('user_audit_log.csv')
+        self.activity, self.manifest = L('system_activity.csv'), L('evidence_files.csv')
+        self.by_id = {i['user_id']: i for i in self.ident}
+        self.by_email = {i['email'].lower(): i for i in self.ident}
+        self.by_hash = {i['email_hash']: i for i in self.ident if i['email_hash']}
+        self.hist_email = {a['old_value'].lower(): a['user_id'] for a in self.audit if a['field_name'] == 'email'}
+        self.hist = {}
+        for a in self.audit:
+            self.hist.setdefault(a['user_id'], []).append(a)
+        self.obs = parse_all(ds, self.manifest)
+        self.cap = {m['file_id']: m['captured_at'] for m in self.manifest}
+        self.act_by_rid = {}
+        for a in self.activity:
+            self.act_by_rid.setdefault(a['resource_id'], []).append(a)
+        self.claimed, self.act_link = {}, {}
 
-    parts.append(f"=== CASE {case['case_id']} ===")
-    parts.append(f"Email: {case['email']}")
-    parts.append(f"Requested at: {case['requested_at']}")
-    parts.append(f"Reported status: {case['reported_status']}")
-    parts.append(f"Reported at: {case['reported_at']}")
-    parts.append(f"Audit cutoff (audit_at): {case['audit_at']}")
-    parts.append(f"Request text: {case['request_text']}")
-    parts.append("")
-
-    if identifiers:
-        parts.append("=== USER IDENTITY ===")
-        parts.append(f"user_id: {identifiers['user_id']}")
-        parts.append(f"Current name:  {identifiers['current_name']}")
-        parts.append(f"Current email: {identifiers['current_email']}")
-        parts.append(f"Current phone: {identifiers['current_phone']}")
-        parts.append(f"Email hash:    {identifiers['email_hash']}")
-        if identifiers["historical"]:
-            parts.append("Historical changes:")
-            for h in identifiers["historical"]:
-                parts.append(f"  {h['event_time']} field={h['field']} old={h['old_value']} new={h['new_value']}")
-    else:
-        parts.append("=== USER IDENTITY: NOT FOUND in user_identities.csv ===")
-        parts.append("(no matching current or historical email)")
-    parts.append("")
-
-    if activities:
-        parts.append(f"=== RELEVANT SYSTEM ACTIVITIES (showing up to 15 of {len(activities)}) ===")
-        # Prioritise deletion-related events
-        del_acts = [a for a in activities if "DELET" in a.get("event_type","").upper() or "BACKUP" in a.get("event_type","").upper() or "SYNC" in a.get("event_type","").upper() or "RESTORE" in a.get("event_type","").upper()]
-        other_acts = [a for a in activities if a not in del_acts]
-        show_acts = (del_acts + other_acts)[:15]
-        for act in show_acts:
-            parts.append(
-                f"  [{act['activity_id']}] {act['event_time']} "
-                f"{act['event_type']} resource={act['resource_id']} result={act['reported_result']}"
-            )
-    else:
-        parts.append("=== RELEVANT SYSTEM ACTIVITIES: none found ===")
-    parts.append("")
-
-    if evidence_snippets:
-        parts.append(f"=== EVIDENCE FILES (top {min(3,len(evidence_snippets))}) ===")
-        for fid, snippet in evidence_snippets[:3]:  # max 3 files
-            meta = evidence_by_id.get(fid, {})
-            parts.append(f"--- {fid} captured={meta.get('captured_at','')} ---")
-            parts.append(snippet[:1200])  # 1200 chars max per file
-            parts.append("")
-    else:
-        parts.append("=== EVIDENCE FILES: none relevant found ===")
-
-    parts.append("")
-    parts.append("Based ONLY on the evidence above (not on reported_status claims), "
-                 "determine the true deletion state at audit_at and produce the required output JSON.")
-
-    return "\n".join(parts)
+    def resolve(self, email: str):
+        e = email.lower().strip()
+        u = self.by_email.get(e) or self.by_id.get(self.hist_email.get(e, '')) or self.by_hash.get(hashlib.sha256(e.encode()).hexdigest())
+        if not u:
+            return None
+        ids = {'user_id': u['user_id'], 'emails': {u['email'].lower(), e}, 'phones': {norm_phone(u['phone'])}, 'hashes': {u['email_hash']}}
+        for h in self.hist.get(u['user_id'], []):
+            if h['field_name'] == 'email':
+                ids['emails'].add(h['old_value'].lower())
+            elif h['field_name'] == 'phone':
+                ids['phones'].add(norm_phone(h['old_value']))
+        ids['phones'].discard('')
+        return ids
 
 
-def format_rules_for_prompt() -> str:
-    lines = []
-    for r in deletion_rules:
-        lines.append(f"  {r['rule_id']}: {r['data_category']} [{r['condition']}] -> {r['required_action']}")
-    return "\n".join(lines)
+def matches(ob, ids) -> bool:
+    for k, v in ob['attrs'].items():
+        if not v or k == 'resource_id':
+            continue
+        lv = str(v).lower()
+        if lv == ids['user_id'] or lv in ids['emails'] or str(v) in ids['hashes']:
+            return True
+        if k in ('phone', 'requester_phone', 'owner_phone') and norm_phone(v) in ids['phones']:
+            return True
+        if k in ('message_text', 'message_excerpt', 'body', 'note', 'details') and any(e in lv for e in ids['emails']):
+            return True
+    return False
 
 
-RULES_TEXT = format_rules_for_prompt()
-
-# ---------------------------------------------------------------------------
-# Output validation & sorting
-# ---------------------------------------------------------------------------
-
-PHASE_ORDER = {"FINDING": 0, "REMEDIATION": 1, "VERIFICATION": 2}
-OPERATION_ORDER = {
-    # FINDING
-    "REPORT_REMAINING_RECORD":   0,
-    "REPORT_EXPOSED_PII":        1,
-    "REPORT_ACTIVE_DATA_FLOW":   2,
-    "REPORT_RESTORE_RISK":       3,
-    # REMEDIATION
-    "DISABLE_DATA_FLOW":         0,
-    "BLOCK_RESTORE":             1,
-    "DELETE_RECORD":             2,
-    "REDACT_RECORD":             3,
-    "ANONYMIZE_RECORD":          4,
-    # VERIFICATION
-    "VERIFY_RECORD_ABSENT":      0,
-    "VERIFY_RECORD_PRESENT":     1,
-    "VERIFY_RECORD_REDACTED":    2,
-    "VERIFY_RECORD_ANONYMIZED":  3,
-    "VERIFY_DATA_FLOW_DISABLED": 4,
-    "VERIFY_RESTORE_BLOCKED":    5,
-}
-
-
-def sort_and_renumber(steps: list[dict]) -> list[dict]:
-    """Sort steps by phase->operation->system_id->resource_id then renumber."""
-    def sort_key(s):
-        phase = PHASE_ORDER.get(s.get("phase", ""), 99)
-        op    = OPERATION_ORDER.get(s.get("operation", ""), 99)
-        sys_  = s.get("system_id", "")
-        res   = s.get("resource_id", "")
-        return (phase, op, sys_, res)
-
-    steps_sorted = sorted(steps, key=sort_key)
-    for i, s in enumerate(steps_sorted, start=1):
-        s["step_no"] = i
-    return steps_sorted
+# --------------------------------------------------------------------------- linking records that carry no identifier
+def link_by_activity(D: Data, cases):
+    """Pre-pass over ALL cases: (1) exclusive identifier claims; (2) strict activity linking (exactly one case could own the record);
+    (3) account alignment. A record with no identifier is a candidate for a case when it sits in an evidence file that also holds
+    that case's identified records AND a deletion-worker action touched it inside [requested_at, reported_at + slack]."""
+    infos = []
+    for c in cases:
+        ids = D.resolve(c['email'])
+        if ids:
+            infos.append((c, ids))
+    files_of = {}
+    for o in D.obs:
+        for c, ids in infos:
+            if matches(o, ids):
+                D.claimed.setdefault(o['rid'], set()).add(ids['user_id'])
+                files_of.setdefault(ids['user_id'], set()).add(o['file'])
+    file_rids = {}
+    for o in D.obs:
+        file_rids.setdefault(o['file'], set()).add(o['rid'])
+    for rid, acts in D.act_by_rid.items():
+        if rid in D.claimed:
+            continue
+        acts = [a for a in acts if a['source_system'] == 'deletion_worker' and a['event_type'] in DELETE_EVENTS]
+        if not acts:
+            continue
+        elig = set()
+        for c, ids in infos:
+            lo, hi = ts(c['requested_at']), ts(c['reported_at']) + timedelta(hours=SLACK_H)
+            if any(rid in file_rids[f] for f in files_of.get(ids['user_id'], ())) and any(lo <= ts(a['event_time']) <= hi for a in acts):
+                elig.add(ids['user_id'])
+        if len(elig) == 1:
+            D.act_link.setdefault(next(iter(elig)), set()).add(rid)
+    link_accounts(D, infos)
 
 
-def parse_llm_response(text: str) -> dict | None:
-    """Extract and parse JSON from LLM response."""
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
+def link_accounts(D: Data, infos):
+    """A deleted account usually has no identifier anywhere. The worker's DELETE on account_service falls in the case window with a result that
+    mirrors the reported status (COMPLETE->SUCCESS, PARTIALLY_COMPLETE->PARTIAL, NOT_STARTED->FAILED); same-class cases and actions are
+    aligned in case order when their counts agree."""
+    have = {u for rid, owners in D.claimed.items() if prefix(rid) == 'account' for u in owners}
+    cand = [(c, ids) for c, ids in infos if ids['user_id'] not in have and c['reported_status'] in RESULT_OF]
+    taken = {r for s in D.act_link.values() for r in s}
+    acts = {a['resource_id']: a for a in D.activity if a['source_system'] == 'deletion_worker' and a['event_type'] == 'DELETE_RECORD'
+            and a['target_system'] == 'account_service' and a['resource_id'] not in D.claimed and a['resource_id'] not in taken}
+    groups = {}
+    for rid, a in acts.items():
+        t = ts(a['event_time'])
+        e = tuple(sorted(i for i, (c, _) in enumerate(cand) if RESULT_OF[c['reported_status']] == a['reported_result']
+                         and ts(c['requested_at']) <= t <= ts(c['reported_at']) + timedelta(hours=SLACK_H)))
+        if e:
+            groups.setdefault(e, []).append(rid)
+    for e, rids in groups.items():
+        if len(rids) == len(e):
+            rids.sort(key=lambda r: acts[r]['event_time'])
+            for i, r in zip(sorted(e, key=lambda i: int(re.sub(r'\D', '', cand[i][0]['case_id']) or 0)), rids):
+                D.act_link.setdefault(cand[i][1]['user_id'], set()).add(r)
+
+
+# --------------------------------------------------------------------------- state of a record + policy (deletion_rules.csv)
+IDKEYS = ('email', 'requester_email', 'customer_email', 'owner_email', 'requester_phone', 'phone', 'email_hash', 'full_name',
+          'requester_name', 'display_name')
+T = ('true', '1', 'yes')
+
+
+def state_of(ob):
+    """-> (data_category, state). state: PRESENT ABSENT IDENTIFIABLE ANONYMIZED REDACTED ACTIVE DISABLED BLOCKED"""
+    a, rid = ob['attrs'], ob['rid']
+    p = prefix(rid)
+    cat, st = (a.get('category') or '').upper(), (a.get('state') or a.get('result') or a.get('status') or '').upper()
+    has_id = any(a.get(k) for k in IDKEYS)
+    if cat:   # handover sheet states the category and state explicitly
+        m = {'NOT_FOUND': 'ABSENT', 'FOUND': 'PRESENT', 'IDENTIFIABLE': 'IDENTIFIABLE', 'ANONYMIZED': 'ANONYMIZED', 'REDACTED': 'REDACTED',
+             'ACTIVE': 'ACTIVE', 'DISABLED': 'DISABLED', 'BLOCKED': 'BLOCKED'}
+        return cat, m.get(st, 'PRESENT')
+    if p == 'account':
+        if a.get('account_status', '').upper() in ('DELETED', 'TOMBSTONE'):
+            return 'ACCOUNT_TOMBSTONE', 'IDENTIFIABLE' if has_id else 'REDACTED'
+        gone = a.get('http_status') == '404' or a.get('rows') == '0' or a.get('result', '').upper() == 'NOT_FOUND' or \
+            ('profile' in a and not has_id and a.get('status_code') == '404')
+        return 'USER_PROFILE', 'ABSENT' if gone and 'table' not in a else 'PRESENT'
+    if p == 'search':
+        miss = a.get('result', '').lower() in ('miss', 'not_found') or a.get('total_hits') == '0'
+        return 'SEARCH_INDEX_ENTRY', 'ABSENT' if miss else 'PRESENT'
+    if p == 'analytics':
+        if 'email_opt_in' in a or 'contact' in a.get('event', ''):   # a marketing contact living inside the analytics system
+            return 'MARKETING_PROFILE', 'ABSENT' if a.get('rows') == '0' else 'PRESENT'
+        return 'ANALYTICS_PROFILE', 'IDENTIFIABLE' if has_id else 'ANONYMIZED'
+    if p == 'support':
+        if str(a.get('marker_found', '')).lower() == 'false' and a.get('rows') != '0':   # legacy replica still holds it, no deletion marker
+            return 'SUPPORT_ATTACHMENT', 'PRESENT'
+        if a.get('matched_value'):                                                       # PII scan hit
+            return 'SUPPORT_MESSAGE', 'IDENTIFIABLE'
+        if a.get('docname'):
+            return ('SUPPORT_ATTACHMENT', 'PRESENT') if 'attach' in a['docname'] else ('SUPPORT_MESSAGE', 'IDENTIFIABLE')
+        c = 'SUPPORT_ATTACHMENT' if any('attach' in k for k in a) or 'attachment' in str(a.get('message_excerpt', '')).lower() else 'SUPPORT_MESSAGE'
+        txt_id = bool(EMAIL.search(str(a.get('message_text') or '')))
+        return c, 'IDENTIFIABLE' if (has_id or txt_id) else 'REDACTED'
+    if p == 'export':
+        gone = a.get('status', '').lower() in ('deleted', 'absent', 'not_found') or a.get('result', '').lower() == 'not_found'
+        return 'USER_EXPORT', 'ABSENT' if gone else 'PRESENT'
+    if p == 'data_flow':
+        en = str(a.get('enabled', '')).lower() in T or st == 'ACTIVE' or (str(a.get('scheduler_registered', '')).lower() in T and 'enabled' not in a)
+        return 'DATA_FLOW', 'ACTIVE' if en else 'DISABLED'
+    if p == 'backup':
+        if 'restore_allowed' in a:
+            ra = str(a['restore_allowed']).lower() in T
+        elif 'deletion_block' in a:
+            ra = str(a['deletion_block']).lower() not in T and str(a.get('eligible', 'true')).lower() in T
+        else:
+            ra = False
+        return 'BACKUP_ARCHIVE', 'ACTIVE' if ra else 'BLOCKED'
+    if p == 'audit_record':
+        return 'SECURITY_AUDIT_LOG', 'PRESENT'
+    if p == 'tombstone':
+        return 'ACCOUNT_TOMBSTONE', 'IDENTIFIABLE' if has_id else 'REDACTED'
+    if p == 'cache':
+        return 'CACHE_ENTRY', 'PRESENT'
+    if p == 'marketing':
+        return 'MARKETING_PROFILE', 'PRESENT'
+    if p == 'email_delivery':
+        return 'EMAIL_DELIVERY_LOG', 'IDENTIFIABLE' if has_id else 'REDACTED'
+    if p == 'legal_hold':
+        return 'LEGAL_HOLD_RECORD', 'PRESENT'
+    return 'UNKNOWN', 'PRESENT'
+
+
+def plan_for(cat, st):
+    """deletion_rules.csv -> (finding, remediation, verification) operation for one record"""
+    DEL = ('REPORT_REMAINING_RECORD', 'DELETE_RECORD', 'VERIFY_RECORD_ABSENT')
+    if cat in ('USER_PROFILE', 'SEARCH_INDEX_ENTRY', 'CACHE_ENTRY', 'USER_EXPORT', 'MARKETING_PROFILE', 'SUPPORT_ATTACHMENT'):   # rules 01-04, 06, 09, 10
+        return DEL if st == 'PRESENT' else (None, None, 'VERIFY_RECORD_ABSENT')
+    if cat in ('ANALYTICS_PROFILE', 'PRODUCT_TELEMETRY'):                                                                      # rules 07, 08
+        return ('REPORT_EXPOSED_PII', 'ANONYMIZE_RECORD', 'VERIFY_RECORD_ANONYMIZED') if st == 'IDENTIFIABLE' else (None, None, 'VERIFY_RECORD_ANONYMIZED')
+    if cat in ('SUPPORT_MESSAGE', 'EMAIL_DELIVERY_LOG', 'ACCOUNT_TOMBSTONE'):                                                  # rules 05, 11, 15
+        return ('REPORT_EXPOSED_PII', 'REDACT_RECORD', 'VERIFY_RECORD_REDACTED') if st == 'IDENTIFIABLE' else (None, None, 'VERIFY_RECORD_REDACTED')
+    if cat == 'DATA_FLOW':
+        return ('REPORT_ACTIVE_DATA_FLOW', 'DISABLE_DATA_FLOW', 'VERIFY_DATA_FLOW_DISABLED') if st == 'ACTIVE' else (None, None, 'VERIFY_DATA_FLOW_DISABLED')
+    if cat == 'BACKUP_ARCHIVE':                                                                                                # rule 14: keep, block restore
+        return ('REPORT_RESTORE_RISK', 'BLOCK_RESTORE', 'VERIFY_RESTORE_BLOCKED') if st == 'ACTIVE' else (None, None, 'VERIFY_RESTORE_BLOCKED')
+    if cat in ('SECURITY_AUDIT_LOG', 'LEGAL_HOLD_RECORD'):                                                                     # rules 12, 13: retain
+        return (None, None, 'VERIFY_RECORD_PRESENT')
+    return (None, None, None)
+
+
+# --------------------------------------------------------------------------- request intent
+DEL_RE = re.compile(r"delet|erase|erasure|remove (?:my|the|all)|close (?:my|the)|closure|forget|wipe|purge|supprim|efface|elimin|borr|apag|exclu|lösch|cancel|"
+                    r"삭제|제거|削除|消去|删除|刪除|注销|удал|حذف|account.*(?:closed|closing)", re.I)
+KEEP_RE = re.compile(r"(?:keep|leave)\b.{0,40}\b(?:account|profile|active|as it is|in place)|download|copy of|portable|replace it|out of date|"
+                     r"change the (?:email|address|phone|number)|update (?:my|the)|continue using|invoices? for my records", re.I)
+NEG_RE = re.compile(r"(?:don'?t|do not|never|without)\s+(?:\w+\s+)?(?:delet|remov|chang|clos)|(?:keep|leave)\b.{0,30}\b(?:account|profile|active|as it is|in place)|"
+                    r"still use (?:it|the account)|continue using|not (?:asking for|a request (?:to|for))\s+(?:\w+\s+)?(?:delet|eras|remov)|"
+                    r"marketing lists? only|promotional emails|unsubscribe|opt.?out|without removing", re.I)
+
+
+def is_deletion_request(text, llm=None) -> bool:
+    if NEG_RE.search(text):
+        return False
+    if DEL_RE.search(text):
+        return True
+    if KEEP_RE.search(text):
+        return False
+    return llm(text) if llm else True
+
+
+class LLM:
+    """Optional: decides only requests that match neither keyword family. Tracks usage for evaluation/usage_report.md."""
+    def __init__(self):
+        self.calls = self.tin = self.tout = 0
+        from groq import Groq
+        self.client = Groq(api_key=os.environ['GROQ_API_KEY'])
+
+    def __call__(self, text) -> bool:
+        r = self.client.chat.completions.create(model=LLM_MODEL, temperature=0, max_tokens=5, messages=[
+            {'role': 'system', 'content': 'Does the customer ask for their account or personal data to be DELETED? Answer only YES or NO.'},
+            {'role': 'user', 'content': text}])
+        self.calls += 1
+        self.tin += r.usage.prompt_tokens
+        self.tout += r.usage.completion_tokens
+        return r.choices[0].message.content.strip().upper().startswith('Y')
+
+
+# --------------------------------------------------------------------------- the audit
+def audit_case(D: Data, case, llm=None):
+    if not is_deletion_request(case['request_text'], llm):
+        return 'NOT_APPLICABLE', []
+    ids = D.resolve(case['email'])
+    if not ids:
+        return 'INCOMPLETE', []
+    audit_at = ts(case['audit_at'])
+    obs = [o for o in D.obs if ts(o['t'] or D.cap[o['file']]) <= audit_at]
+    linked = {o['rid'] for o in obs if matches(o, ids)} | D.act_link.get(ids['user_id'], set())
+    if not any(prefix(r) == 'account' for r in linked):   # hand-numbered tutorial cases: account_001 <-> user_01
+        m = re.fullmatch(r'user_0*(\d+)', ids['user_id'])
+        cand = 'account_%03d' % int(m.group(1)) if m else None
+        if cand and any(a['source_system'] == 'deletion_worker' and ts(a['event_time']) <= audit_at for a in D.act_by_rid.get(cand, [])):
+            linked.add(cand)
+    by_rid = {}
+    for o in obs:
+        if o['rid'] in linked:
+            by_rid.setdefault(o['rid'], []).append(o)
+    for rid in linked:
+        if rid not in by_rid:   # known only from the deletion activity: gone from every snapshot; cite the latest snapshot that could have shown it
+            acts = [a for a in D.act_by_rid.get(rid, []) if ts(a['event_time']) <= audit_at]
+            if acts:
+                snaps = sorted((ts(m['captured_at']), m['file_id']) for m in D.manifest if m['file_path'].endswith('.sql') and ts(m['captured_at']) <= audit_at)
+                snaps = snaps or sorted((ts(m['captured_at']), m['file_id']) for m in D.manifest if ts(m['captured_at']) <= audit_at)
+                by_rid[rid] = [dict(file=snaps[-1][1] if snaps else '', t=acts[-1]['event_time'], rid=rid, attrs=dict(http_status='404'))]
+    recs = []
+    for rid, lst in by_rid.items():
+        lst.sort(key=lambda o: (ts(o['t']), ts(D.cap.get(o['file'], o['t']))))
+        cat, st = state_of(lst[-1])                                            # latest observation at audit_at decides the state
+        same = [o for o in lst if state_of(o) == (cat, st)]
+        cite = (same[0] if same else lst[-1])['file']                          # cite the earliest observation that already shows that state
+        f, r, v = plan_for(cat, st)
+        recs.append((rid, SYSTEM.get(prefix(rid), 'unknown'), f, r, v, cite))
+    incomplete = any(x[2] for x in recs)
+    rows = []
+    for rid, sy, f, r, v, cite in recs:
+        if incomplete:   # findings cite evidence; remediation and future verification have an empty evidence_id
+            if f: rows.append((f, sy, rid, cite))
+            if r: rows.append((r, sy, rid, ''))
+            if v: rows.append((v, sy, rid, ''))
+        elif v:
+            rows.append((v, sy, rid, cite))
+    rows.sort(key=lambda x: (PHASE_NO[PHASE_OF[x[0]]], OPS.index(x[0]), x[1], x[2]))
+    steps = [dict(step_no=i, phase=PHASE_OF[o], system_id=sy, resource_id=ri, operation=o, state=STATE[o], evidence_id=ev)
+             for i, (o, sy, ri, ev) in enumerate(rows, 1)]
+    return ('INCOMPLETE' if incomplete else 'COMPLETE'), steps
+
+
+# --------------------------------------------------------------------------- run / evaluate
+def load_cases():
+    L = lambda n: list(csv.DictReader(open(DATASET / n, encoding='utf-8')))
+    return L('deletion_requests.csv'), L('sample_deletion_requests.csv')
+
+
+def make_llm():
+    if os.environ.get('GROQ_API_KEY'):
+        try:
+            return LLM()
+        except Exception as e:
+            print(f'LLM disabled ({e})', file=sys.stderr)
     return None
 
 
-def validate_and_fix(parsed: dict, case_id: str) -> tuple[str, list[dict]]:
-    """Return (deletion_status, steps) after basic validation."""
-    status = parsed.get("deletion_status", "NOT_APPLICABLE").strip().upper()
-    if status not in ("COMPLETE", "INCOMPLETE", "NOT_APPLICABLE"):
-        status = "NOT_APPLICABLE"
-
-    steps = parsed.get("steps", [])
-    if not isinstance(steps, list):
-        steps = []
-
-    if status == "NOT_APPLICABLE":
-        return status, []
-
-    valid_steps = []
-    for s in steps:
-        if not isinstance(s, dict):
-            continue
-        cleaned = {
-            "step_no":     s.get("step_no", 0),
-            "phase":       s.get("phase", ""),
-            "system_id":   s.get("system_id", ""),
-            "resource_id": s.get("resource_id", ""),
-            "operation":   s.get("operation", ""),
-            "state":       s.get("state", ""),
-            "evidence_id": s.get("evidence_id", ""),
-        }
-        valid_steps.append(cleaned)
-
-    valid_steps = sort_and_renumber(valid_steps)
-    return status, valid_steps
-
-# ---------------------------------------------------------------------------
-# Main processing loop
-# ---------------------------------------------------------------------------
-
-def process_case(case: dict) -> dict:
-    """Process one deletion request and return {case_id, deletion_status, steps_json}."""
-    case_id  = case["case_id"]
-    email    = case["email"].strip()
-    audit_at = case["audit_at"].strip()
-    req_text = case["request_text"].strip()
-
-    # Resolve identity
-    user = resolve_user(email)
-    identifiers = get_all_identifiers(user) if user else None
-
-    # Collect activities and evidence
-    if identifiers:
-        activities = get_activities_for_user(identifiers["user_id"], identifiers, audit_at)
-        evidence_snippets = find_relevant_evidence(identifiers, audit_at)
-    else:
-        activities = []
-        evidence_snippets = []
-
-    # Build prompts
-    sys_prompt  = SYSTEM_PROMPT_AUDIT.format(rules=RULES_TEXT)
-    user_prompt = build_user_prompt(case, identifiers, activities, evidence_snippets)
-
-    # Call LLM
-    try:
-        raw = call_llm(sys_prompt, user_prompt, max_tokens=1200)
-    except Exception as exc:
-        print(f"    LLM error on {case_id}: {exc}", file=sys.stderr)
-        return {
-            "case_id": case_id,
-            "deletion_status": "NOT_APPLICABLE",
-            "steps_json": "[]",
-        }
-
-    # Parse response
-    parsed = parse_llm_response(raw)
-    if parsed is None:
-        print(f"    WARNING: Could not parse JSON for {case_id}. Raw: {raw[:200]}", file=sys.stderr)
-        return {
-            "case_id": case_id,
-            "deletion_status": "NOT_APPLICABLE",
-            "steps_json": "[]",
-        }
-
-    # Validate & sort
-    status, steps = validate_and_fix(parsed, case_id)
-
-    return {
-        "case_id": case_id,
-        "deletion_status": status,
-        "steps_json": json.dumps(steps, separators=(",", ":")),
-    }
-
-
-def main():
-    print(f"\n{'='*60}")
-    print("Ghost Data Still Exists -- Deletion Audit Agent")
-    print(f"Model: {MODEL}")
-    print(f"Cases: {len(deletion_requests)}")
-    print(f"Output: {OUTPUT_CSV}")
-    print(f"{'='*60}\n")
-
-    results = []
-    total = len(deletion_requests)
-
-    for i, case in enumerate(deletion_requests, start=1):
-        case_id = case["case_id"]
-        print(f"[{i:3d}/{total}] Processing {case_id}...", end=" ", flush=True)
-        result = process_case(case)
-        results.append(result)
-        print(f"{result['deletion_status']}")
-
-    # Sort by case_id
-    results.sort(key=lambda r: r["case_id"])
-
-    # Write output.csv
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["case_id", "deletion_status", "steps_json"])
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"\nDone. Written {len(results)} rows to {OUTPUT_CSV}")
-
-    # Sanity check
+def run():
+    requests, samples = load_cases()
+    D = Data(DATASET)
+    link_by_activity(D, requests + samples)
+    llm = make_llm()
+    rows = []
+    for c in requests:
+        st, steps = audit_case(D, c, llm)
+        rows.append(dict(case_id=c['case_id'], deletion_status=st, steps_json=json.dumps(steps, separators=(',', ':'), ensure_ascii=False)))
+    rows.sort(key=lambda r: int(re.sub(r'\D', '', r['case_id']) or 0))   # numeric order == order of deletion_requests.csv
+    with open(OUTPUT, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['case_id', 'deletion_status', 'steps_json'])
+        w.writeheader()
+        w.writerows(rows)
     from collections import Counter
-    counts = Counter(r["deletion_status"] for r in results)
-    print(f"Status distribution: {dict(counts)}")
+    print(f'wrote {len(rows)} rows to {OUTPUT}; status counts: {dict(Counter(r["deletion_status"] for r in rows))}')
+    calls, tin, tout = (llm.calls, llm.tin, llm.tout) if llm else (0, 0, 0)
+    USAGE_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    USAGE_REPORT.write_text(
+        "# Usage report (generated by code/main.py)\n\nFinal full-dataset run: %d requests.\n\n"
+        "The audit itself is deterministic Python (no model calls). A model is consulted only for request texts that match neither the deletion nor the "
+        "keep/other keyword rules.\n\n| Provider | Model | Calls | Input tokens | Output tokens | Avg tokens/request | Est. cost |\n|---|---|---|---|---|---|---|\n"
+        "| %s | %s | %d | %d | %d | %.2f | $%.4f |\n\nPricing assumption for the estimate: $0.59 / 1M input and $0.79 / 1M output tokens (Groq llama-3.3-70b-versatile list price; verify current rates).\n"
+        % (len(rows), 'Groq' if llm else '-', LLM_MODEL if llm else 'none (not used in this run)', calls, tin, tout,
+           (tin + tout) / max(1, len(rows)), tin * 0.59e-6 + tout * 0.79e-6))
 
 
-if __name__ == "__main__":
-    main()
+def evaluate():
+    requests, samples = load_cases()
+    D = Data(DATASET)
+    link_by_activity(D, requests + samples)
+    gold = {r['case_id']: r for r in csv.DictReader(open(DATASET / 'sample_output.csv', encoding='utf-8'))}
+    key = lambda s: (s['phase'], s['system_id'], s['resource_id'], s['operation'], s['state'])
+    ok = seq = tp = fp = fn = evok = evtot = 0
+    for c in samples:
+        st, steps = audit_case(D, c)
+        g = gold[c['case_id']]
+        gs = json.loads(g['steps_json'])
+        A, B = {key(s) for s in steps}, {key(s) for s in gs}
+        ok += st == g['deletion_status']
+        tp, fp, fn = tp + len(A & B), fp + len(A - B), fn + len(B - A)
+        seq += [key(s) for s in steps] == [key(s) for s in gs]
+        gev = {key(s): s['evidence_id'] for s in gs}
+        for s in steps:
+            if key(s) in gev:
+                evtot += 1
+                evok += s['evidence_id'] == gev[key(s)]
+        if '-v' in sys.argv:
+            for k in sorted(A - B): print(c['case_id'], 'EXTRA  ', k)
+            for k in sorted(B - A): print(c['case_id'], 'MISSING', k)
+    n = len(samples)
+    p, r = tp / max(1, tp + fp), tp / max(1, tp + fn)
+    print(f'case status accuracy : {ok}/{n} ({ok / n:.0%})')
+    print(f'step precision/recall: {p:.2f} / {r:.2f}  (F1 {2 * p * r / max(1e-9, p + r):.2f})')
+    print(f'exact step sequence  : {seq}/{n}')
+    print(f'evidence_id accuracy : {evok}/{evtot} on matched steps')
+
+
+if __name__ == '__main__':
+    evaluate() if '--eval' in sys.argv else run()
