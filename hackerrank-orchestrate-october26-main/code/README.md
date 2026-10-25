@@ -1,106 +1,109 @@
-# Ghost Data Still Exists — Solution README
+# Ghost Data Still Exists - Solution
 
 ## Overview
 
-AI-powered deletion audit agent for the HackerRank Orchestrate October 2026 challenge.
-The agent audits whether a user's personal data has been fully deleted across all platform systems and produces an ordered remediation plan if it has not.
+This solution audits each deletion request against identity history, system
+activity, and participant-provided evidence. Deterministic Python code performs
+identity resolution, evidence parsing, record-state evaluation, policy
+application, and ordered output generation. Groq is optional and is used only
+to classify request text that the deterministic intent rules do not recognize.
 
-## Architecture
+## Requirements
 
-```
-code/
-├── main.py                    # Main agent entry point
-└── evaluation/
-    ├── evaluation_report.md   # Accuracy analysis and custom test cases
-    └── usage_report.md        # Token usage and cost analysis
-```
+- Python 3.10 or newer
+- No required third-party packages
+- Optional: `groq` and a `GROQ_API_KEY` environment variable for ambiguous
+  request-intent classification
+- Optional: `pdfplumber` for PDF evidence when the `pdftotext` utility is not
+  available
 
-**Pipeline per case:**
-1. **Identity resolution** — looks up request email in current + historical identity tables
-2. **Activity filtering** — finds relevant system_activity rows (up to audit_at cutoff)
-3. **Evidence extraction** — reads relevant evidence files (logs, JSON, SQL, images)
-4. **LLM reasoning** — sends context to Groq llama-3.3-70b-versatile for deletion status + steps
-5. **Deterministic post-processing** — sorts steps per spec, renumbers, validates JSON
+Install optional packages only if needed:
 
-## Setup
-
-### Requirements
-
-- Python 3.10+
-- Groq API key (set `GROQ_API_KEY` environment variable)
-
-### Install dependencies
-
-```bash
-pip install groq pandas python-dotenv
+```powershell
+python -m pip install groq pdfplumber
 ```
 
-Optional (for PDF evidence files):
-```bash
-pip install pdfplumber
+Set the optional Groq key in PowerShell:
+
+```powershell
+$env:GROQ_API_KEY = "your_key_here"
 ```
 
-### Set your API key
+The program does not load `.env` files. Do not put credentials in source code
+or the submission archive.
 
-Either export in your shell:
-```bash
-export GROQ_API_KEY=your_key_here       # macOS / Linux
-set GROQ_API_KEY=your_key_here          # Windows CMD
-$env:GROQ_API_KEY="your_key_here"       # Windows PowerShell
+## Account linking
+
+Direct identifier evidence is preferred. Activity-based account associations
+are made only when the status/time candidate group is one-to-one and the
+resource has no explicit conflicting owner evidence. An account directly
+matched to exactly one user may also be included when its deletion-worker
+event falls within that request's window; its state is still determined from
+observations at or before `audit_at`. Ambiguous activity-only groups are left
+unlinked rather than assigned by ordering.
+
+## Run
+
+From the repository root, generate predictions for all 518 requests:
+
+```powershell
+python code\main.py
 ```
 
-Or create a `.env` file in the repository root:
-```
-GROQ_API_KEY=your_key_here
-```
+The generated `output.csv` is written to the repository root. Run the sample
+evaluation against `dataset/sample_output.csv` with:
 
-## Running
-
-From the **repository root**:
-
-```bash
-python code/main.py
+```powershell
+python code\main.py --eval
 ```
 
-Output is written to `output.csv` in the repository root.
+Optional linking diagnostics can be enabled for local troubleshooting:
 
-## Model
+```powershell
+python code\main.py --eval --debug-linking
+```
 
-- **Provider**: Groq
-- **Model**: `llama-3.3-70b-versatile`
-- **Temperature**: 0 (deterministic)
+Diagnostics may print user identifiers and should not be used in shared logs.
 
-## Output Format
+## Output
+
+`output.csv` has the required columns:
 
 ```csv
 case_id,deletion_status,steps_json
-case_33,COMPLETE,"[{""step_no"":1,""phase"":""VERIFICATION"",...}]"
-case_34,INCOMPLETE,"[{""step_no"":1,""phase"":""FINDING"",...}]"
 ```
 
-`deletion_status` is one of: `COMPLETE`, `INCOMPLETE`, `NOT_APPLICABLE`
+Each request receives one `COMPLETE`, `INCOMPLETE`, or `NOT_APPLICABLE`
+prediction. Steps are JSON arrays ordered by phase, operation, system, and
+resource as specified in the challenge.
 
-`steps_json` is an ordered JSON array of step objects per the problem specification.
+## Submission contents
 
-## Submission Checklist
+The `code.zip` archive contains this README, the repository README, the
+standalone `code/main.py` entry point, and both evaluation reports. The dataset,
+credentials, caches, and exploratory scripts are excluded.
 
-- [x] `output.csv` at repository root with 518 rows sorted by `case_id`
-- [x] Valid JSON array in every `steps_json` field
-- [x] Consecutive step numbers starting at 1
-- [x] Steps ordered: FINDING → REMEDIATION → VERIFICATION
-- [x] FINDING steps cite `evidence_id` from participant-visible files
-- [x] REMEDIATION and future VERIFICATION steps use `evidence_id=""`
-- [x] `code/evaluation/evaluation_report.md` included
-- [x] `code/evaluation/usage_report.md` included
-- [x] No API keys in code or config
-- [x] No `dataset/` in `code.zip`
-
-## Packaging (Windows PowerShell)
+Create the archive from the repository root in PowerShell:
 
 ```powershell
-Compress-Archive -Path README.md, code -DestinationPath code.zip -Force
+@'
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+files = [
+    "README.md",
+    "code/README.md",
+    "code/main.py",
+    "code/evaluation/evaluation_report.md",
+    "code/evaluation/usage_report.md",
+]
+with ZipFile("code.zip", "w", compression=ZIP_DEFLATED) as archive:
+    for name in files:
+        archive.write(Path(name), name)
+'@ | python -
 ```
 
-## Challenge Submission URL
+Submit `output.csv` and `log.txt` separately in their corresponding HackerRank
+submission fields.
 
-https://www.hackerrank.com/contests/hackerrank-orchestrate-october26/challenges/ghost-data-still-exists
+Challenge: <https://www.hackerrank.com/contests/hackerrank-orchestrate-october26/challenges/ghost-data-still-exists>

@@ -2,7 +2,7 @@
 Ghost Data Still Exists -- deletion-audit agent.
 
     python code/main.py          # audits dataset/deletion_requests.csv -> output.csv (+ code/evaluation/usage_report.md)
-    python code/main.py --eval   # scores the pipeline on dataset/sample_* and prints case/step/sequence/evidence accuracy
+    python code/main.py --eval   # scores case, step, sequence, evidence, and sample account-link accuracy
 
 Pipeline (deterministic core, optional LLM only for ambiguous request intent):
   1. identity   : current + historical email / phone / user_id / email hash
@@ -25,6 +25,7 @@ OUTPUT = ROOT / "output.csv"
 USAGE_REPORT = Path(__file__).resolve().parent / "evaluation" / "usage_report.md"
 LLM_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")   # only used for ambiguous intent
 SLACK_H = 1.0   # deletion actions may land up to this long after reported_at
+DEBUG_LINKING = '--debug-linking' in sys.argv
 
 # --------------------------------------------------------------------------- constants
 OPS = ['REPORT_REMAINING_RECORD', 'REPORT_EXPOSED_PII', 'REPORT_ACTIVE_DATA_FLOW', 'REPORT_RESTORE_RISK',
@@ -256,6 +257,23 @@ def matches(ob, ids) -> bool:
     return False
 
 
+def resource_owner_index(D: Data):
+    owners = {}
+    for observation in D.obs:
+        attrs = observation['attrs']
+        for key in ('email', 'requester_email', 'customer_email', 'owner_email', 'subject', 'lookup_key'):
+            value = attrs.get(key)
+            if value and '@' in str(value):
+                ids = D.resolve(str(value))
+                if ids:
+                    owners.setdefault(observation['rid'], set()).add(ids['user_id'])
+        for key in ('user_id', 'subject_reference', 'customer_reference'):
+            value = attrs.get(key)
+            if value and str(value).lower().startswith('user') and str(value).lower() in D.by_id:
+                owners.setdefault(observation['rid'], set()).add(str(value))
+    return owners
+
+
 # --------------------------------------------------------------------------- linking records that carry no identifier
 def link_by_activity(D: Data, cases):
     """Pre-pass over ALL cases: (1) exclusive identifier claims; (2) strict activity linking (exactly one case could own the record);
@@ -266,6 +284,7 @@ def link_by_activity(D: Data, cases):
         ids = D.resolve(c['email'])
         if ids:
             infos.append((c, ids))
+    resource_owners = resource_owner_index(D)
     files_of = {}
     for o in D.obs:
         for c, ids in infos:
@@ -283,18 +302,19 @@ def link_by_activity(D: Data, cases):
             continue
         elig = set()
         for c, ids in infos:
+            if resource_owners.get(rid, set()) - {ids['user_id']}:
+                continue
             lo, hi = ts(c['requested_at']), ts(c['reported_at']) + timedelta(hours=SLACK_H)
             if any(rid in file_rids[f] for f in files_of.get(ids['user_id'], ())) and any(lo <= ts(a['event_time']) <= hi for a in acts):
                 elig.add(ids['user_id'])
         if len(elig) == 1:
             D.act_link.setdefault(next(iter(elig)), set()).add(rid)
-    link_accounts(D, infos)
+    link_accounts(D, infos, resource_owners)
 
 
-def link_accounts(D: Data, infos):
-    """A deleted account usually has no identifier anywhere. The worker's DELETE on account_service falls in the case window with a result that
-    mirrors the reported status (COMPLETE->SUCCESS, PARTIALLY_COMPLETE->PARTIAL, NOT_STARTED->FAILED); same-class cases and actions are
-    aligned in case order when their counts agree."""
+def link_accounts(D: Data, infos, resource_owners=None):
+    """Link deleted accounts only when status and time-window candidates are unambiguous."""
+    resource_owners = resource_owners if resource_owners is not None else resource_owner_index(D)
     have = {u for rid, owners in D.claimed.items() if prefix(rid) == 'account' for u in owners}
     cand = [(c, ids) for c, ids in infos if ids['user_id'] not in have and c['reported_status'] in RESULT_OF]
     taken = {r for s in D.act_link.values() for r in s}
@@ -307,11 +327,32 @@ def link_accounts(D: Data, infos):
                          and ts(c['requested_at']) <= t <= ts(c['reported_at']) + timedelta(hours=SLACK_H)))
         if e:
             groups.setdefault(e, []).append(rid)
+    if DEBUG_LINKING:
+        print("\n[ACCOUNT LINK DEBUG]")
+        for e, rids in groups.items():
+            print("Candidate case indexes:", e)
+            print("Candidate resources:", rids)
+            print(
+                "Candidate cases:",
+                [
+                    {
+                        "case_id": cand[i][0]["case_id"],
+                        "user_id": cand[i][1]["user_id"],
+                        "status": cand[i][0]["reported_status"],
+                    }
+                    for i in e
+                ],
+            )
     for e, rids in groups.items():
-        if len(rids) == len(e):
-            rids.sort(key=lambda r: acts[r]['event_time'])
-            for i, r in zip(sorted(e, key=lambda i: int(re.sub(r'\D', '', cand[i][0]['case_id']) or 0)), rids):
-                D.act_link.setdefault(cand[i][1]['user_id'], set()).add(r)
+        if len(e) != 1 or len(rids) != 1:
+            continue
+        case_index = e[0]
+        resource_id = rids[0]
+        case_ids = cand[case_index][1]
+        user_id = case_ids['user_id']
+        if resource_owners.get(resource_id, set()) - {user_id}:
+            continue
+        D.act_link.setdefault(user_id, set()).add(resource_id)
 
 
 # --------------------------------------------------------------------------- state of a record + policy (deletion_rules.csv)
@@ -446,7 +487,43 @@ def audit_case(D: Data, case, llm=None):
         return 'INCOMPLETE', []
     audit_at = ts(case['audit_at'])
     obs = [o for o in D.obs if ts(o['t'] or D.cap[o['file']]) <= audit_at]
-    linked = {o['rid'] for o in obs if matches(o, ids)} | D.act_link.get(ids['user_id'], set())
+    if DEBUG_LINKING and case['case_id'] in {'case_03', 'case_04', 'case_18', 'case_20', 'case_23'}:
+        print(f"\n[TRACE] {case['case_id']} audit_at={case['audit_at']}")
+        print(f"[TRACE] Resolved emails: {sorted(ids['emails'])}")
+        print(f"[TRACE] Resolved phones: {sorted(ids['phones'])}")
+        for o in obs:
+            if matches(o, ids):
+                print(
+                    f"[TRACE] MATCH rid={o['rid']} "
+                    f"file={o['file']} time={o['t']} "
+                    f"attrs={o['attrs']}"
+                )
+    request_start = ts(case['requested_at'])
+    request_end = ts(case['reported_at']) + timedelta(hours=SLACK_H)
+    directly_claimed_accounts = {
+        rid
+        for rid, owners in D.claimed.items()
+        if prefix(rid) == 'account' and owners == {ids['user_id']}
+        and any(
+            a['source_system'] == 'deletion_worker'
+            and a['event_type'] == 'DELETE_RECORD'
+            and a['target_system'] == 'account_service'
+            and request_start <= ts(a['event_time']) <= request_end
+            for a in D.act_by_rid.get(rid, [])
+        )
+    }
+    linked = (
+        {o['rid'] for o in obs if matches(o, ids)}
+        | D.act_link.get(ids['user_id'], set())
+        | directly_claimed_accounts
+    )
+    if DEBUG_LINKING and case['case_id'] in {
+        'case_03', 'case_04', 'case_11', 'case_18',
+        'case_20', 'case_23', 'case_32'
+    }:
+        print(f"\n[DEBUG] Case: {case['case_id']}")
+        print(f"[DEBUG] User ID: {ids['user_id']}")
+        print(f"[DEBUG] Linked resources: {sorted(linked)}")
     if not any(prefix(r) == 'account' for r in linked):   # hand-numbered tutorial cases: account_001 <-> user_01
         m = re.fullmatch(r'user_0*(\d+)', ids['user_id'])
         cand = 'account_%03d' % int(m.group(1)) if m else None
@@ -471,6 +548,16 @@ def audit_case(D: Data, case, llm=None):
         cite = (same[0] if same else lst[-1])['file']                          # cite the earliest observation that already shows that state
         f, r, v = plan_for(cat, st)
         recs.append((rid, SYSTEM.get(prefix(rid), 'unknown'), f, r, v, cite))
+        if DEBUG_LINKING and case['case_id'] in {
+            'case_03', 'case_04', 'case_11', 'case_18',
+            'case_20', 'case_23', 'case_32'
+        }:
+            print(
+                f"[DEBUG] {rid}: "
+                f"category={cat}, state={st}, "
+                f"finding={f}, remediation={r}, "
+                f"verification={v}, evidence={cite}"
+            )
     incomplete = any(x[2] for x in recs)
     rows = []
     for rid, sy, f, r, v, cite in recs:
@@ -510,7 +597,7 @@ def run():
     for c in requests:
         st, steps = audit_case(D, c, llm)
         rows.append(dict(case_id=c['case_id'], deletion_status=st, steps_json=json.dumps(steps, separators=(',', ':'), ensure_ascii=False)))
-    rows.sort(key=lambda r: int(re.sub(r'\D', '', r['case_id']) or 0))   # numeric order == order of deletion_requests.csv
+    rows.sort(key=lambda r: r['case_id'])
     with open(OUTPUT, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=['case_id', 'deletion_status', 'steps_json'])
         w.writeheader()
@@ -518,14 +605,27 @@ def run():
     from collections import Counter
     print(f'wrote {len(rows)} rows to {OUTPUT}; status counts: {dict(Counter(r["deletion_status"] for r in rows))}')
     calls, tin, tout = (llm.calls, llm.tin, llm.tout) if llm else (0, 0, 0)
+    total_tokens = tin + tout
+    total_cost = tin * 0.59e-6 + tout * 0.79e-6
     USAGE_REPORT.parent.mkdir(parents=True, exist_ok=True)
     USAGE_REPORT.write_text(
-        "# Usage report (generated by code/main.py)\n\nFinal full-dataset run: %d requests.\n\n"
-        "The audit itself is deterministic Python (no model calls). A model is consulted only for request texts that match neither the deletion nor the "
-        "keep/other keyword rules.\n\n| Provider | Model | Calls | Input tokens | Output tokens | Avg tokens/request | Est. cost |\n|---|---|---|---|---|---|---|\n"
-        "| %s | %s | %d | %d | %d | %.2f | $%.4f |\n\nPricing assumption for the estimate: $0.59 / 1M input and $0.79 / 1M output tokens (Groq llama-3.3-70b-versatile list price; verify current rates).\n"
-        % (len(rows), 'Groq' if llm else '-', LLM_MODEL if llm else 'none (not used in this run)', calls, tin, tout,
-           (tin + tout) / max(1, len(rows)), tin * 0.59e-6 + tout * 0.79e-6))
+        "# Usage report (generated by code/main.py)\n\n"
+        f"Final full-dataset run: {len(rows)} requests.\n\n"
+        "The audit is deterministic Python. Groq is optional and is consulted only "
+        "for request text that the deterministic intent rules cannot classify.\n\n"
+        "| Provider | Model | Calls | Input tokens | Output tokens | Total tokens | "
+        "Average tokens/request | Estimated total cost | Estimated cost/request |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        f"| {'Groq' if llm else '-'} | {LLM_MODEL if llm else 'none (not used)'} | "
+        f"{calls} | {tin} | {tout} | {total_tokens} | "
+        f"{total_tokens / max(1, len(rows)):.2f} | ${total_cost:.4f} | "
+        f"${total_cost / max(1, len(rows)):.6f} |\n"
+        f"| **Overall** | - | {calls} | {tin} | {tout} | {total_tokens} | "
+        f"{total_tokens / max(1, len(rows)):.2f} | ${total_cost:.4f} | "
+        f"${total_cost / max(1, len(rows)):.6f} |\n\n"
+        "Pricing assumption: $0.59 / 1M input tokens and $0.79 / 1M output "
+        "tokens for Groq llama-3.3-70b-versatile; verify current rates."
+    )
 
 
 def evaluate():
@@ -534,29 +634,56 @@ def evaluate():
     link_by_activity(D, requests + samples)
     gold = {r['case_id']: r for r in csv.DictReader(open(DATASET / 'sample_output.csv', encoding='utf-8'))}
     key = lambda s: (s['phase'], s['system_id'], s['resource_id'], s['operation'], s['state'])
-    ok = seq = tp = fp = fn = evok = evtot = 0
+    status_correct = exact_rows = exact_semantic_sequences = exact_step_arrays = 0
+    tp = fp = fn = evidence_correct = evidence_total = 0
+    account_correct = account_incorrect = account_abstained = 0
     for c in samples:
         st, steps = audit_case(D, c)
         g = gold[c['case_id']]
         gs = json.loads(g['steps_json'])
         A, B = {key(s) for s in steps}, {key(s) for s in gs}
-        ok += st == g['deletion_status']
-        tp, fp, fn = tp + len(A & B), fp + len(A - B), fn + len(B - A)
-        seq += [key(s) for s in steps] == [key(s) for s in gs]
+        status_matches = st == g['deletion_status']
+        semantic_sequence_matches = [key(s) for s in steps] == [key(s) for s in gs]
+        full_steps_match = steps == gs
+        status_correct += status_matches
+        exact_rows += status_matches and full_steps_match
+        exact_semantic_sequences += semantic_sequence_matches
+        exact_step_arrays += full_steps_match
+        tp += len(A & B)
+        fp += len(A - B)
+        fn += len(B - A)
+        predicted_accounts = {s['resource_id'] for s in steps if prefix(s['resource_id']) == 'account'}
+        expected_accounts = {s['resource_id'] for s in gs if prefix(s['resource_id']) == 'account'}
+        correct_accounts = predicted_accounts & expected_accounts
+        incorrect_accounts = predicted_accounts - expected_accounts
+        abstained_accounts = expected_accounts - predicted_accounts
+        account_correct += len(correct_accounts)
+        account_incorrect += len(incorrect_accounts)
+        account_abstained += len(abstained_accounts)
         gev = {key(s): s['evidence_id'] for s in gs}
         for s in steps:
             if key(s) in gev:
-                evtot += 1
-                evok += s['evidence_id'] == gev[key(s)]
+                evidence_total += 1
+                evidence_correct += s['evidence_id'] == gev[key(s)]
         if '-v' in sys.argv:
             for k in sorted(A - B): print(c['case_id'], 'EXTRA  ', k)
             for k in sorted(B - A): print(c['case_id'], 'MISSING', k)
+            if incorrect_accounts or abstained_accounts:
+                print(c['case_id'], 'ACCOUNT EXTRA VS EXPECTED', sorted(incorrect_accounts),
+                      'ABSTAINED EXPECTED', sorted(abstained_accounts))
     n = len(samples)
     p, r = tp / max(1, tp + fp), tp / max(1, tp + fn)
-    print(f'case status accuracy : {ok}/{n} ({ok / n:.0%})')
-    print(f'step precision/recall: {p:.2f} / {r:.2f}  (F1 {2 * p * r / max(1e-9, p + r):.2f})')
-    print(f'exact step sequence  : {seq}/{n}')
-    print(f'evidence_id accuracy : {evok}/{evtot} on matched steps')
+    f1 = 2 * p * r / max(1e-9, p + r)
+    print(f'case status accuracy : {status_correct}/{n} ({status_correct / max(1, n):.0%})')
+    print(f'exact output-row accuracy: {exact_rows}/{n} ({exact_rows / max(1, n):.1%})')
+    print(f'step precision       : {p:.2f} ({tp} TP, {fp} FP)')
+    print(f'step recall          : {r:.2f} ({tp} TP, {fn} FN)')
+    print(f'step F1              : {f1:.2f}')
+    print(f'exact semantic step sequences: {exact_semantic_sequences}/{n}')
+    print(f'exact full step arrays       : {exact_step_arrays}/{n}')
+    print(f'evidence ID accuracy         : {evidence_correct}/{evidence_total} on matched steps')
+    print(f'account-link sample comparison: matches_expected={account_correct}, '
+          f'extra_vs_expected={account_incorrect}, abstained_expected={account_abstained}')
 
 
 if __name__ == '__main__':

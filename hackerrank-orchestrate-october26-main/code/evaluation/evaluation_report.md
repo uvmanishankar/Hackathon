@@ -1,153 +1,129 @@
-# Evaluation Report — Ghost Data Still Exists
+# Evaluation Report - Ghost Data Still Exists
 
-## Overview
+## Automated sample evaluation
 
-This report covers the deletion-audit agent built for the HackerRank Orchestrate October 2026 challenge.
-The agent processes 518 deletion requests from `dataset/deletion_requests.csv` and produces `output.csv`.
+The deterministic evaluator in `code/main.py --eval` compares all 32 supplied
+sample requests with `dataset/sample_output.csv`.
 
----
+| Metric | Result |
+| --- | ---: |
+| Deletion-status accuracy | 32/32 (100%) |
+| Exact output-row accuracy (status and full step objects) | 15/32 (46.9%) |
+| Step precision | 0.99 |
+| Step recall | 0.91 |
+| Step F1 | 0.95 |
+| Exact semantic step sequences (phase/system/resource/operation/state) | 16/32 |
+| Exact full step arrays including evidence IDs | 15/32 |
+| Evidence ID accuracy on matched steps | 175/176 |
+| Account IDs matching sample expectations | 24 |
+| Account IDs extra versus sample expectations | 1 |
+| Expected account IDs not predicted | 8 |
 
-## Architecture
+The step-field precision/recall values are micro-averaged over semantic step
+tuples: 176 true positives, 2 extra predicted tuples, and 17 expected tuples
+not predicted. Evidence IDs are scored separately on matched semantic steps.
+The exact-row metric compares deletion status and every step field, including
+step number and evidence ID.
+Running `python code\main.py --eval` prints each metric above directly from the
+current implementation and `dataset/sample_output.csv`; the table is not a
+manually entered result.
 
-The solution is a single-pass Python agent (`code/main.py`) that for each case:
+Account figures are a sample-output comparison, not independent proof that an
+association is correct. The account matcher abstains when its status/time
+candidate group is ambiguous; a one-case/one-resource group remains a
+provisional heuristic association. Do not interpret expected-output agreement
+as identity evidence.
 
-1. **Identity resolution**: Looks up the request email in `user_identities.csv` (current) and `user_audit_log.csv` (historical). Also tries SHA-256 email-hash matching.
-2. **Activity filtering**: Scans `system_activity.csv` for rows whose `details` or `resource_id` contain any known identifier (email, phone, user_id) up to `audit_at`.
-3. **Evidence extraction**: Reads evidence files (logs, JSON, SQL, images) captured ≤ `audit_at`, extracts the snippet around the first matching identifier.
-4. **LLM reasoning**: Sends a structured prompt to `llama-3.3-70b-versatile` on Groq with the case details, identity, activities, and evidence snippets.
-5. **Output validation**: Parses the JSON response, sorts steps per the spec (phase → operation → system_id → resource_id), renumbers, and writes `output.csv`.
+All 16 non-exact semantic step sequences differ in their step sets; none are
+ordering-only mismatches. The emitted arrays are still sorted by the required
+phase, operation, `system_id`, and `resource_id` ordering. The exact-sequence
+score therefore reflects missed or extra steps as well as sequence equality.
 
----
+`--eval -v` prints per-case step differences and account IDs that differ from
+the sample answer. `--debug-linking` enables detailed local traces, including
+resolved identifiers; those diagnostics should not be shared publicly.
 
-## Case-Level Deletion-Status Accuracy
+## Additional evaluation cases
 
-Evaluated against `dataset/sample_output.csv` (32 public sample cases).
+The following supplemental scenarios were created to exercise policy behavior.
+They are scenario specifications and are not included in the automated 32-case
+metrics above.
 
-| Metric | Value |
-|--------|-------|
-| Cases evaluated (sample) | 32 |
-| Correct status | ~28 / 32 (~87%) |
-| COMPLETE accuracy | High (evidence-backed verification steps) |
-| INCOMPLETE accuracy | High (finding + remediation + verification) |
-| NOT_APPLICABLE accuracy | High (non-deletion requests correctly identified) |
+### Case EV-01: Marketing opt-out, not a deletion request
 
-The main error mode is cases where the request email does not directly appear in activity logs (identity not resolved), causing conservative NOT_APPLICABLE or INCOMPLETE defaults.
+**Input:** A user asks to unsubscribe from marketing emails and be removed from
+the marketing list.
 
----
+**Expected:** `NOT_APPLICABLE` with `steps_json` equal to `[]`. A marketing
+preference change alone does not authorize a personal-data deletion audit.
 
-## Step-Level and Field-Level Accuracy
+### Case EV-02: Backup can restore deleted data
 
-| Dimension | Notes |
-|-----------|-------|
-| Phase assignment | Correct (FINDING/REMEDIATION/VERIFICATION) |
-| Operation selection | Correct per deletion_rules.csv mapping |
-| State values | Correct per allowed operation-state pairs |
-| evidence_id citation | FINDING steps cite file_id; REMEDIATION/VERIFICATION (future) use "" |
-| Ordering within phase | Sorted by operation order, then system_id, resource_id ascending |
-| Step numbering | Consecutive from 1 after sorting |
+**Input:** The primary account is absent, but a backup predating the deletion
+can restore the user's data.
 
----
+**Expected:** `INCOMPLETE`, with a restore-risk finding, a `BLOCK_RESTORE`
+remediation step, and verification for the account and blocked restore path.
 
-## Sequence Accuracy
+### Case EV-03: Tombstone still contains direct identifiers
 
-Steps are deterministically sorted and renumbered post-LLM:
-- Phase order: FINDING → REMEDIATION → VERIFICATION
-- Within FINDING: REPORT_REMAINING_RECORD, REPORT_EXPOSED_PII, REPORT_ACTIVE_DATA_FLOW, REPORT_RESTORE_RISK
-- Within REMEDIATION: DISABLE_DATA_FLOW, BLOCK_RESTORE, DELETE_RECORD, REDACT_RECORD, ANONYMIZE_RECORD
-- Within VERIFICATION: VERIFY_RECORD_ABSENT, VERIFY_RECORD_PRESENT, VERIFY_RECORD_REDACTED, VERIFY_RECORD_ANONYMIZED, VERIFY_DATA_FLOW_DISABLED, VERIFY_RESTORE_BLOCKED
+**Input:** A retained account tombstone contains the user's name, email, or
+phone number.
 
-This ensures sequence accuracy is not dependent on LLM ordering alone.
+**Expected:** `INCOMPLETE`, with an exposed-PII finding, a `REDACT_RECORD`
+remediation step, and a redaction verification. The tombstone's stable internal
+user reference may remain when policy permits it.
 
----
+### Case EV-04: Properly anonymized analytics and retained audit record
 
-## Additional Evaluation Cases (Created by Team)
+**Input:** The account is absent, analytics data is irreversibly anonymized,
+and a security audit record required by policy remains.
 
-### Case EV-01: Non-deletion marketing opt-out request
-**Input**:
+**Expected:** `COMPLETE`, with evidence-backed verification for the account,
+anonymized analytics record, and retained audit record.
+
+## Failures found and improvements made
+
+- **Ambiguous account association:** The earlier account linker paired
+  status/time-compatible resources and cases by sorted order. Matching status
+  and time establishes eligibility, not identity. It was replaced with
+  conservative one-case/one-resource linking; ambiguous groups are left
+  unresolved. A resource is also excluded from activity linking when its
+  evidence explicitly resolves to a different user's identity.
+- **Direct identity account recovery:** A uniquely identity-claimed account
+  with a deletion-worker event inside the request window can be linked even
+  when the identifying observation was captured after `audit_at`. Its state is
+  still computed only from audit-eligible observations. This recovers
+  `account_3866` for `case_27`; the matching pre-audit service export reports
+  the account absent.
+- **Expected-output account mismatches remain:** The sample comparison reports
+  one extra account ID and eight expected IDs not predicted. Several of the
+  missing accounts are in candidate groups shared by multiple requests; the
+  available status/time evidence does not identify which user owns which
+  resource. The remaining extra (`account_6523` for `case_17`) has a direct
+  historical identifier match, but its deletion activity is outside the
+  request window. These conflicts should not be "fixed" by positional pairing.
+- **Missing analytics verifications:** The anonymized analytics rows have no
+  remaining email, phone, or user reference. Their deletion activities and
+  evidence bundles overlap multiple eligible sample requests, so the supplied
+  data does not establish a unique user-to-resource association.
+- **Missing retained audit verifications:** `audit_record_6645` and
+  `audit_record_5569` do not appear in parsed evidence observations or
+  `system_activity.csv`; there is no source-backed resource to verify for
+  `case_18` or `case_20`.
+- **Diagnostics obscured normal output:** Linking and trace diagnostics are
+  gated behind `--debug-linking`, leaving the regular evaluator output concise.
+- **Sequence score needs step-coverage work:** Since all non-exact sample arrays
+  also differ in their step sets, the next improvement is evidence discovery
+  and resource coverage, not changing the deterministic sort order.
+- **Evidence citation discrepancy:** One matched sample step has an evidence
+  ID different from the expected answer; citation selection should be reviewed
+  separately from status and step-set evaluation.
+
+## Reproduction
+
+From the repository root:
+
+```powershell
+python code\main.py --eval
 ```
-email: test@example.com
-request_text: "I want to unsubscribe from all marketing emails. Please remove me from your list."
-reported_status: COMPLETE
-```
-**Expected**: `NOT_APPLICABLE` with `steps=[]`
-**Reasoning**: "unsubscribe from marketing" is a marketing opt-out, not a data deletion request.
-**Result**: Agent correctly returns NOT_APPLICABLE.
-
----
-
-### Case EV-02: Deletion with backup restore risk
-**Input**:
-```
-email: user@example.com
-request_text: "Please delete my account and all personal data."
-reported_status: COMPLETE
-```
-**Evidence**: Account deleted from primary, but backup_service shows active backup `backup_XYZ` that predates deletion and can restore data.
-**Expected**: `INCOMPLETE` with:
-- FINDING: REPORT_RESTORE_RISK for backup_XYZ
-- REMEDIATION: BLOCK_RESTORE for backup_XYZ
-- VERIFICATION: VERIFY_RECORD_ABSENT (account), VERIFY_RESTORE_BLOCKED (backup_XYZ)
-**Result**: Agent correctly identifies restore risk and plans remediation.
-
----
-
-### Case EV-03: ACCOUNT_TOMBSTONE with PII not yet redacted
-**Input**:
-```
-email: user@example.com
-request_text: "Please close my account and delete my personal data permanently."
-reported_status: COMPLETE
-```
-**Evidence**: identity_service shows tombstone record with name/email/phone still present (not redacted).
-**Expected**: `INCOMPLETE` with:
-- FINDING: REPORT_EXPOSED_PII for tombstone record (identity_service)
-- REMEDIATION: REDACT_RECORD for tombstone (remove name/email/phone)
-- VERIFICATION: VERIFY_RECORD_ABSENT (account), VERIFY_RECORD_REDACTED (tombstone)
-**Result**: Agent correctly identifies PII exposure in tombstone and plans REDACT_RECORD remediation.
-
----
-
-### Case EV-04: COMPLETE with analytics anonymization
-**Input**:
-```
-email: user@example.com
-request_text: "I request erasure of all my data."
-reported_status: COMPLETE
-```
-**Evidence**: account deleted, analytics_platform shows record anonymized, security_service audit_record present (RETAIN).
-**Expected**: `COMPLETE` with verification steps for all three resources, each citing evidence.
-**Result**: Agent correctly identifies completion and generates evidence-backed verification steps only.
-
----
-
-## Failures Found and Improvements Made
-
-### Failure 1: Identity not found for uppercase emails
-**Problem**: Some requests use uppercase emails (e.g., `SIPHO.MOKOENA@GMAIL.COM`). Initial version used exact match.
-**Fix**: Added `.lower()` normalization on all email lookups and identity map keys.
-
-### Failure 2: LLM hallucinating resource_ids
-**Problem**: When no activities/evidence were found, the LLM invented resource IDs.
-**Fix**: Added explicit instruction "Only cite resource_ids found in the evidence above." Also added evidence snippet extraction to ground the LLM.
-
-### Failure 3: Incorrect phase ordering
-**Problem**: LLM sometimes placed REMEDIATION before FINDING or mixed phases.
-**Fix**: Added deterministic `sort_and_renumber()` post-processing that enforces the correct order regardless of LLM output.
-
-### Failure 4: JSON parse failures on malformed LLM output
-**Problem**: LLM occasionally wraps JSON in markdown fences or adds prose.
-**Fix**: Strip markdown fences before parsing; fall back to regex extraction of first `{...}` block.
-
-### Failure 5: Evidence captured after audit_at incorrectly cited
-**Problem**: Some evidence files had `captured_at` after `audit_at` and were initially included.
-**Fix**: Added strict `captured_at <= audit_at` filter in `find_relevant_evidence()`.
-
-### Failure 6: Activity flooding for common emails
-**Problem**: Emails in shared services returned hundreds of unrelated activity rows.
-**Fix**: Capped at 60 most-recent relevant activities per case in the prompt. Activities matched by user_id in details for precision.
-
----
-
-## Summary
-
-The agent achieves strong case-level accuracy by combining deterministic identity resolution and evidence extraction with LLM reasoning. Post-processing guarantees step ordering and numbering compliance regardless of LLM output quality. The main remaining error mode is cases where evidence is entirely absent (no files mention the user's identifiers), where the agent conservatively marks the case as INCOMPLETE or relies entirely on LLM reasoning without grounding.
