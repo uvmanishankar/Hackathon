@@ -6,7 +6,7 @@ Ghost Data Still Exists -- deletion-audit agent.
 
 Pipeline (deterministic core, optional LLM only for ambiguous request intent):
   1. identity   : current + historical email / phone / user_id / email hash
-  2. evidence   : logs (kv + JSON lines), JSON exports/bundles, SQLite snapshots (incl. JSON-column and replica drift), handover txt, PDFs
+  2. evidence   : logs, JSON/SQLite exports, handover text, PDFs, and locally OCR'd screenshot rows with source provenance
   3. linking    : a record belongs to the user if any observation carries one of the user's identifiers; records with no identifier
                   (deleted accounts, anonymized analytics) are attached through deletion-worker activity (see link_* functions)
   4. state      : latest observation at/before audit_at decides the state of each record; reported_status is never trusted
@@ -23,9 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 DATASET = ROOT / "dataset"
 OUTPUT = ROOT / "output.csv"
 USAGE_REPORT = Path(__file__).resolve().parent / "evaluation" / "usage_report.md"
+MISMATCH_REPORT = Path(__file__).resolve().parent / "evaluation" / "sample_mismatch_report.md"
 LLM_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")   # only used for ambiguous intent
 SLACK_H = 1.0   # deletion actions may land up to this long after reported_at
 DEBUG_LINKING = '--debug-linking' in sys.argv
+WRITE_MISMATCH_REPORT = '--mismatch-report' in sys.argv
 
 # --------------------------------------------------------------------------- constants
 OPS = ['REPORT_REMAINING_RECORD', 'REPORT_EXPOSED_PII', 'REPORT_ACTIVE_DATA_FLOW', 'REPORT_RESTORE_RISK',
@@ -44,6 +46,7 @@ DELETE_EVENTS = {'DELETE_RECORD', 'ANONYMIZE_RECORD', 'REDACT_RECORD', 'DISABLE_
 RESULT_OF = {'COMPLETE': 'SUCCESS', 'PARTIALLY_COMPLETE': 'PARTIAL', 'NOT_STARTED': 'FAILED'}
 
 RID = re.compile(r'\b((?:account|search|analytics|support|export|data_flow|backup|audit_record|tombstone|cache|email_delivery|marketing|legal_hold)_[0-9]+)\b')
+OCR_RID = re.compile(r'\b(account|search|analytics|support|export|data_flow|backup|audit_record|tombstone|cache|email_delivery|marketing|legal_hold)[_ .-]*(\d{3,})\b', re.I)
 KV = re.compile(r'(\w+)=("[^"]*"|\S+)')
 EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
 USERREF = re.compile(r'\buser_?\s?(\d+)\b', re.I)
@@ -188,16 +191,129 @@ def parse_pdf(path, fid, captured_at):
     return [dict(file=fid, t=captured_at, rid=r, snap=captured_at,
                  attrs=dict(docname=path.stem.lower(), **{f'id{i}': v for i, v in enumerate(sorted(ids))}))
             for r in sorted(set(RID.findall(text)))]
-# NOTE: .png console screenshots are not parsed (OCR cannot reliably attribute table rows to one user; precision matters more).
+
+
+def parse_image(path, fid, captured_at, source_path):
+    """OCR resource rows and keep identity only when it appears in that same visual row."""
+    import pytesseract
+    from PIL import Image, ImageOps
+    from pytesseract import Output
+
+    executable = os.environ.get('TESSERACT_CMD') or shutil.which('tesseract')
+    if not executable:
+        for candidate in (
+            Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+            Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'),
+        ):
+            if candidate.is_file():
+                executable = str(candidate)
+                break
+    if not executable:
+        raise RuntimeError('Tesseract OCR executable not found; set TESSERACT_CMD or install Tesseract')
+    pytesseract.pytesseract.tesseract_cmd = executable
+
+    with Image.open(path) as source:
+        raw = source.copy()
+        image = ImageOps.autocontrast(source.convert('L')).resize(
+            (source.width * 3 // 2, source.height * 3 // 2),
+            Image.Resampling.LANCZOS,
+        )
+        binary = image.point(lambda pixel: 255 if pixel >= 150 else 0)
+
+    observations = {}
+    for processed in (raw, binary):
+        data = pytesseract.image_to_data(processed, config='--psm 6', output_type=Output.DICT)
+        words = []
+        for index, text in enumerate(data['text']):
+            text = text.strip()
+            try:
+                confidence = float(data['conf'][index])
+            except (TypeError, ValueError):
+                continue
+            if text and confidence >= 20:
+                words.append((
+                    data['left'][index],
+                    data['top'][index] + data['height'][index] / 2,
+                    text,
+                    confidence,
+                ))
+        words.sort(key=lambda word: (word[1], word[0]))
+
+        rows = []
+        for word in words:
+            row = next((candidate for candidate in reversed(rows)
+                        if abs(candidate['center_y'] - word[1]) <= 12), None)
+            if row is None:
+                row = {'center_y': word[1], 'words': []}
+                rows.append(row)
+            row['words'].append(word)
+
+        for row in rows:
+            row_words = sorted(row['words'], key=lambda word: word[0])
+            text_parts, spans, offset = [], [], 0
+            for _, _, word, confidence in row_words:
+                if text_parts:
+                    offset += 1
+                start = offset
+                text_parts.append(word)
+                offset += len(word)
+                spans.append((start, offset, confidence))
+            row_text = ' '.join(text_parts)
+
+            def span_confidence(start, end):
+                scores = [score for left, right, score in spans if left < end and right > start]
+                return min(scores) if scores else 0
+
+            emails = {
+                match.group().lower()
+                for match in EMAIL.finditer(row_text)
+                if span_confidence(*match.span()) >= 35
+            }
+            user_ids = {
+                'user_' + match.group(1)
+                for match in USERREF.finditer(row_text)
+                if span_confidence(*match.span()) >= 35
+            }
+            owners = {}
+            if len(user_ids) == 1:
+                owners['user_id'] = next(iter(user_ids))
+            elif not user_ids and len(emails) == 1:
+                owners['email'] = next(iter(emails))
+
+            for match in OCR_RID.finditer(row_text):
+                confidence = span_confidence(*match.span())
+                if confidence < 40:
+                    continue
+                rid = f'{match.group(1).lower()}_{match.group(2)}'
+                attrs = {
+                    **owners,
+                    'ocr_text': row_text,
+                    'ocr_confidence': str(round(confidence)),
+                    'source_image': path.name,
+                    'source_path': source_path,
+                    'captured_at': captured_at,
+                }
+                key = (rid, owners.get('user_id'), owners.get('email'))
+                observation = dict(file=fid, t=captured_at, rid=rid, snap=captured_at, attrs=attrs)
+                previous = observations.get(key)
+                if not previous or confidence > float(previous['attrs']['ocr_confidence']):
+                    observations[key] = observation
+
+    return list(observations.values())
 
 
 def parse_all(ds, manifest):
-    obs = []
+    obs, image_count, image_observation_count, unrecognized_images = [], 0, 0, 0
     for ev in manifest:
         p, fid, cap, suf = ds / ev['file_path'], ev['file_id'], ev['captured_at'], Path(ev['file_path']).suffix.lower()
         try:
             o = (parse_log(p, fid) if suf == '.log' else parse_json(p, fid) if suf == '.json' else parse_sql(p, fid, cap) if suf == '.sql'
-                 else parse_txt(p.read_text(errors='replace'), fid) if suf == '.txt' else parse_pdf(p, fid, cap) if suf == '.pdf' else [])
+                 else parse_txt(p.read_text(errors='replace'), fid) if suf == '.txt' else parse_pdf(p, fid, cap) if suf == '.pdf'
+                 else parse_image(p, fid, cap, ev['file_path']) if suf in {'.png', '.jpg', '.jpeg', '.webp'} else [])
+            if suf in {'.png', '.jpg', '.jpeg', '.webp'}:
+                image_count += 1
+                image_observation_count += len(o)
+                unrecognized_images += not o
         except Exception as e:
             print(f'  warning: could not parse {ev["file_path"]}: {e}', file=sys.stderr)
             o = []
@@ -205,6 +321,13 @@ def parse_all(ds, manifest):
             x['t'] = x['t'] or cap
             x.setdefault('snap', cap)
         obs += o
+    if image_count:
+        print(
+            f'  image evidence OCR: processed {image_count} files, '
+            f'extracted {image_observation_count} resource observations; '
+            f'{unrecognized_images} images had no confident resource IDs',
+            file=sys.stderr,
+        )
     return obs
 
 
@@ -285,6 +408,12 @@ def link_by_activity(D: Data, cases):
         if ids:
             infos.append((c, ids))
     resource_owners = resource_owner_index(D)
+    ocr_resources = {o['rid'] for o in D.obs if 'ocr_confidence' in o['attrs']}
+    unattributed_analytics = {
+        o['rid'] for o in D.obs
+        if prefix(o['rid']) == 'analytics'
+        and str(o['attrs'].get('subject', '')).lower() == 'no direct identifier'
+    }
     files_of = {}
     for o in D.obs:
         for c, ids in infos:
@@ -296,6 +425,10 @@ def link_by_activity(D: Data, cases):
         file_rids.setdefault(o['file'], set()).add(o['rid'])
     for rid, acts in D.act_by_rid.items():
         if rid in D.claimed:
+            continue
+        if rid in ocr_resources:
+            continue
+        if rid in unattributed_analytics and not resource_owners.get(rid):
             continue
         acts = [a for a in acts if a['source_system'] == 'deletion_worker' and a['event_type'] in DELETE_EVENTS]
         if not acts:
@@ -512,8 +645,9 @@ def audit_case(D: Data, case, llm=None):
             for a in D.act_by_rid.get(rid, [])
         )
     }
+    direct_matches = {o['rid'] for o in obs if matches(o, ids)}
     linked = (
-        {o['rid'] for o in obs if matches(o, ids)}
+        {rid for rid in direct_matches if prefix(rid) != 'account'}
         | D.act_link.get(ids['user_id'], set())
         | directly_claimed_accounts
     )
@@ -537,9 +671,22 @@ def audit_case(D: Data, case, llm=None):
         if rid not in by_rid:   # known only from the deletion activity: gone from every snapshot; cite the latest snapshot that could have shown it
             acts = [a for a in D.act_by_rid.get(rid, []) if ts(a['event_time']) <= audit_at]
             if acts:
-                snaps = sorted((ts(m['captured_at']), m['file_id']) for m in D.manifest if m['file_path'].endswith('.sql') and ts(m['captured_at']) <= audit_at)
-                snaps = snaps or sorted((ts(m['captured_at']), m['file_id']) for m in D.manifest if ts(m['captured_at']) <= audit_at)
-                by_rid[rid] = [dict(file=snaps[-1][1] if snaps else '', t=acts[-1]['event_time'], rid=rid, attrs=dict(http_status='404'))]
+                user_evidence = sorted(
+                    (ts(D.cap[o['file']]), o['file'])
+                    for o in obs if matches(o, ids)
+                )
+                snapshots = sorted(
+                    (ts(m['captured_at']), m['file_id'])
+                    for m in D.manifest
+                    if m['file_path'].endswith(('.sql', '.json'))
+                    and ts(m['captured_at']) <= audit_at
+                )
+                cite = (
+                    user_evidence[-1][1] if user_evidence
+                    else snapshots[-1][1] if snapshots
+                    else ''
+                )
+                by_rid[rid] = [dict(file=cite, t=acts[-1]['event_time'], rid=rid, attrs=dict(http_status='404'))]
     recs = []
     for rid, lst in by_rid.items():
         lst.sort(key=lambda o: (ts(o['t']), ts(D.cap.get(o['file'], o['t']))))
@@ -637,6 +784,9 @@ def evaluate():
     status_correct = exact_rows = exact_semantic_sequences = exact_step_arrays = 0
     tp = fp = fn = evidence_correct = evidence_total = 0
     account_correct = account_incorrect = account_abstained = 0
+    field_correct = {field: 0 for field in ('step_no', 'phase', 'system_id', 'resource_id', 'operation', 'state', 'evidence_id')}
+    field_total = {field: 0 for field in field_correct}
+    mismatch_cases = []
     for c in samples:
         st, steps = audit_case(D, c)
         g = gold[c['case_id']]
@@ -652,6 +802,16 @@ def evaluate():
         tp += len(A & B)
         fp += len(A - B)
         fn += len(B - A)
+        for position in range(max(len(steps), len(gs))):
+            predicted_step = steps[position] if position < len(steps) else {}
+            expected_step = gs[position] if position < len(gs) else {}
+            for field in field_correct:
+                if field in predicted_step or field in expected_step:
+                    field_total[field] += 1
+                    field_correct[field] += (
+                        field in predicted_step and field in expected_step
+                        and predicted_step[field] == expected_step[field]
+                    )
         predicted_accounts = {s['resource_id'] for s in steps if prefix(s['resource_id']) == 'account'}
         expected_accounts = {s['resource_id'] for s in gs if prefix(s['resource_id']) == 'account'}
         correct_accounts = predicted_accounts & expected_accounts
@@ -661,10 +821,26 @@ def evaluate():
         account_incorrect += len(incorrect_accounts)
         account_abstained += len(abstained_accounts)
         gev = {key(s): s['evidence_id'] for s in gs}
+        evidence_mismatches = []
         for s in steps:
             if key(s) in gev:
                 evidence_total += 1
                 evidence_correct += s['evidence_id'] == gev[key(s)]
+                if s['evidence_id'] != gev[key(s)]:
+                    evidence_mismatches.append(
+                        (key(s), gev[key(s)], s['evidence_id'])
+                    )
+        if not status_matches or not full_steps_match:
+            mismatch_cases.append({
+                'case_id': c['case_id'],
+                'expected_status': g['deletion_status'],
+                'predicted_status': st,
+                'missing': sorted(B - A),
+                'extra': sorted(A - B),
+                'evidence_mismatches': evidence_mismatches,
+                'expected_steps': gs,
+                'predicted_steps': steps,
+            })
         if '-v' in sys.argv:
             for k in sorted(A - B): print(c['case_id'], 'EXTRA  ', k)
             for k in sorted(B - A): print(c['case_id'], 'MISSING', k)
@@ -682,8 +858,81 @@ def evaluate():
     print(f'exact semantic step sequences: {exact_semantic_sequences}/{n}')
     print(f'exact full step arrays       : {exact_step_arrays}/{n}')
     print(f'evidence ID accuracy         : {evidence_correct}/{evidence_total} on matched steps')
+    print('step field accuracy (position-aligned):')
+    for field in field_correct:
+        print(f'  {field:12}: {field_correct[field]}/{field_total[field]} '
+              f'({field_correct[field] / max(1, field_total[field]):.1%})')
     print(f'account-link sample comparison: matches_expected={account_correct}, '
           f'extra_vs_expected={account_incorrect}, abstained_expected={account_abstained}')
+    if WRITE_MISMATCH_REPORT:
+        write_mismatch_report(
+            mismatch_cases, len(samples), status_correct, exact_rows,
+            exact_semantic_sequences, exact_step_arrays, tp, fp, fn,
+            evidence_correct, evidence_total, field_correct, field_total,
+        )
+        print(f'per-case mismatch report: {MISMATCH_REPORT}')
+
+
+def write_mismatch_report(cases, count, status_correct, exact_rows,
+                          exact_semantic_sequences, exact_step_arrays,
+                          tp, fp, fn, evidence_correct, evidence_total,
+                          field_correct, field_total):
+    lines = [
+        '# Sample Mismatch Report',
+        '',
+        'Generated by `python code\\\\main.py --eval --mismatch-report` from the '
+        'current source and `dataset/sample_output.csv`.',
+        '',
+        '## Summary',
+        '',
+        f'- Cases: {count}',
+        f'- Status accuracy: {status_correct}/{count} '
+        f'({status_correct / max(1, count):.1%})',
+        f'- Exact output rows: {exact_rows}/{count} '
+        f'({exact_rows / max(1, count):.1%})',
+        f'- Exact semantic step sequences: {exact_semantic_sequences}/{count}',
+        f'- Exact full step arrays: {exact_step_arrays}/{count}',
+        f'- Semantic step counts: {tp} TP, {fp} FP, {fn} FN',
+        f'- Evidence ID accuracy: {evidence_correct}/{evidence_total}',
+        '',
+        '| Field (position-aligned) | Correct | Compared | Accuracy |',
+        '|---|---:|---:|---:|',
+    ]
+    for field, correct in field_correct.items():
+        total = field_total[field]
+        lines.append(f'| `{field}` | {correct} | {total} | {correct / max(1, total):.1%} |')
+    lines.extend(['', '## Case-level differences', ''])
+    if not cases:
+        lines.append('No differences against the supplied sample baseline.')
+    for case in cases:
+        lines.extend([
+            f"### {case['case_id']}",
+            '',
+            f"- Status: expected `{case['expected_status']}`, "
+            f"predicted `{case['predicted_status']}`.",
+        ])
+        if case['missing']:
+            lines.append('- Missing semantic steps:')
+            lines.extend(f'  - `{step}`' for step in case['missing'])
+        if case['extra']:
+            lines.append('- Extra semantic steps:')
+            lines.extend(f'  - `{step}`' for step in case['extra'])
+        if case['evidence_mismatches']:
+            lines.append('- Evidence ID mismatches on matched semantic steps:')
+            lines.extend(
+                f'  - `{step}`: expected `{expected}`, predicted `{predicted}`'
+                for step, expected, predicted in case['evidence_mismatches']
+            )
+        if case['expected_steps'] != case['predicted_steps']:
+            lines.extend([
+                '- Expected step array:',
+                f'  ```json\n  {json.dumps(case["expected_steps"], separators=(",", ":"))}\n  ```',
+                '- Predicted step array:',
+                f'  ```json\n  {json.dumps(case["predicted_steps"], separators=(",", ":"))}\n  ```',
+            ])
+        lines.append('')
+    MISMATCH_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    MISMATCH_REPORT.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8')
 
 
 if __name__ == '__main__':

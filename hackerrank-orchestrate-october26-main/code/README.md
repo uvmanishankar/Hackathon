@@ -16,12 +16,28 @@ to classify request text that the deterministic intent rules do not recognize.
   request-intent classification
 - Optional: `pdfplumber` for PDF evidence when the `pdftotext` utility is not
   available
+- Optional: `pytesseract`, Pillow, and the local Tesseract OCR executable for
+  PNG/JPEG/WebP screenshot evidence
 
 Install optional packages only if needed:
 
 ```powershell
-python -m pip install groq pdfplumber
+python -m pip install groq pdfplumber pytesseract pillow
 ```
+
+Install the Tesseract executable separately. On Windows, set its path when it
+is not on `PATH` or in the standard installation directory:
+
+```powershell
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+```
+
+Screenshot OCR runs locally; image contents are not sent to an external
+service. The parser keeps the evidence file ID, manifest path, capture time,
+source image name, OCR text, and confidence with each extracted observation.
+It only attaches a user ID or email recognized in the same visual row as a
+resource. OCR-only resources without a direct owner are not linked through
+file co-occurrence.
 
 Set the optional Groq key in PowerShell:
 
@@ -57,6 +73,17 @@ evaluation against `dataset/sample_output.csv` with:
 python code\main.py --eval
 ```
 
+To also generate a per-case mismatch report and position-aligned field
+accuracy metrics:
+
+```powershell
+python code\main.py --eval --mismatch-report
+```
+
+The report is written to
+`code/evaluation/sample_mismatch_report.md`. It lists missing/extra semantic
+steps, evidence-ID mismatches, and expected/predicted step arrays.
+
 Optional linking diagnostics can be enabled for local troubleshooting:
 
 ```powershell
@@ -80,7 +107,7 @@ resource as specified in the challenge.
 ## Submission contents
 
 The `code.zip` archive contains this README, the repository README, the
-standalone `code/main.py` entry point, and both evaluation reports. The dataset,
+standalone `code/main.py` entry point, and the evaluation reports. The dataset,
 credentials, caches, and exploratory scripts are excluded.
 
 Create the archive from the repository root in PowerShell:
@@ -96,10 +123,13 @@ files = [
     "code/main.py",
     "code/evaluation/evaluation_report.md",
     "code/evaluation/usage_report.md",
+    "code/evaluation/sample_mismatch_report.md",
 ]
 with ZipFile("code.zip", "w", compression=ZIP_DEFLATED) as archive:
     for name in files:
-        archive.write(Path(name), name)
+        path = Path(name)
+        if path.exists():
+            archive.write(path, name)
 '@ | python -
 ```
 

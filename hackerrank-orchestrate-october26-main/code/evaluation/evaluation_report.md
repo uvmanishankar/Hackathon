@@ -8,25 +8,44 @@ sample requests with `dataset/sample_output.csv`.
 | Metric | Result |
 | --- | ---: |
 | Deletion-status accuracy | 32/32 (100%) |
-| Exact output-row accuracy (status and full step objects) | 15/32 (46.9%) |
-| Step precision | 0.99 |
+| Exact output-row accuracy (status and full step objects) | 18/32 (56.2%) |
+| Step precision | 1.00 |
 | Step recall | 0.91 |
 | Step F1 | 0.95 |
-| Exact semantic step sequences (phase/system/resource/operation/state) | 16/32 |
-| Exact full step arrays including evidence IDs | 15/32 |
-| Evidence ID accuracy on matched steps | 175/176 |
+| Exact semantic step sequences (phase/system/resource/operation/state) | 18/32 |
+| Exact full step arrays including evidence IDs | 18/32 |
+| Evidence ID accuracy on matched steps | 176/176 |
 | Account IDs matching sample expectations | 24 |
-| Account IDs extra versus sample expectations | 1 |
+| Account IDs extra versus sample expectations | 0 |
 | Expected account IDs not predicted | 8 |
 
 The step-field precision/recall values are micro-averaged over semantic step
-tuples: 176 true positives, 2 extra predicted tuples, and 17 expected tuples
-not predicted. Evidence IDs are scored separately on matched semantic steps.
+tuples: 176 true positives, no extra predicted tuples, and 17 expected tuples
+not predicted. All 176 matched semantic steps cite the expected evidence ID.
 The exact-row metric compares deletion status and every step field, including
 step number and evidence ID.
 Running `python code\main.py --eval` prints each metric above directly from the
 current implementation and `dataset/sample_output.csv`; the table is not a
 manually entered result.
+
+Run `python code\main.py --eval --mismatch-report` to generate
+`code/evaluation/sample_mismatch_report.md`, including per-case missing and
+extra steps, evidence-ID mismatches, and expected/predicted arrays. It also
+reports position-aligned field accuracy (each compared position is scored
+against the corresponding expected step; missing positions count as incorrect):
+
+| Field | Correct / compared | Accuracy |
+| --- | ---: | ---: |
+| `step_no` | 176/193 | 91.2% |
+| `phase` | 176/193 | 91.2% |
+| `system_id` | 145/193 | 75.1% |
+| `resource_id` | 145/193 | 75.1% |
+| `operation` | 150/193 | 77.7% |
+| `state` | 150/193 | 77.7% |
+| `evidence_id` | 176/193 | 91.2% |
+
+These position-aligned scores are diagnostic and should not be confused with
+the semantic tuple or matched-step evidence metrics above.
 
 Account figures are a sample-output comparison, not independent proof that an
 association is correct. The account matcher abstains when its status/time
@@ -34,7 +53,7 @@ candidate group is ambiguous; a one-case/one-resource group remains a
 provisional heuristic association. Do not interpret expected-output agreement
 as identity evidence.
 
-All 16 non-exact semantic step sequences differ in their step sets; none are
+All 14 non-exact semantic step sequences differ in their step sets; none are
 ordering-only mismatches. The emitted arrays are still sorted by the required
 phase, operation, `system_id`, and `resource_id` ordering. The exact-sequence
 score therefore reflects missed or extra steps as well as sequence equality.
@@ -82,7 +101,16 @@ and a security audit record required by policy remains.
 **Expected:** `COMPLETE`, with evidence-backed verification for the account,
 anonymized analytics record, and retained audit record.
 
-## Failures found and improvements made
+## Mismatch investigation and improvements
+
+- **Evidence fallback selected an unrelated snapshot:** For an account known
+  absent only from deletion activity, the fallback always preferred the
+  newest SQL file, even when it was from an unrelated system and the user had
+  a newer directly linked evidence bundle. It now prefers the latest
+  pre-audit file already matched to that user's identity, with a snapshot
+  fallback only when no such file exists. This corrected the `case_31`
+  citation from `evidence_57` to `evidence_51` without changing the linked
+  resource set.
 
 - **Ambiguous account association:** The earlier account linker paired
   status/time-compatible resources and cases by sorted order. Matching status
@@ -90,6 +118,16 @@ anonymized analytics record, and retained audit record.
   conservative one-case/one-resource linking; ambiguous groups are left
   unresolved. A resource is also excluded from activity linking when its
   evidence explicitly resolves to a different user's identity.
+- **Out-of-window account activity:** A directly identified account is linked
+  to a deletion request only when its deletion-worker event falls within that
+  request's time window. This removed the extra `account_6523` prediction for
+  `case_17`; the observation's deletion event occurred after the request's
+  reported time.
+- **Unattributed anonymized analytics:** File co-occurrence and a deletion
+  event are not sufficient to assign an analytics record whose evidence
+  explicitly says it has no direct identifier. Excluding that heuristic
+  association removed the extra `analytics_9447` prediction for `case_11`.
+  Other anonymous records remain unresolved unless stronger evidence exists.
 - **Direct identity account recovery:** A uniquely identity-claimed account
   with a deletion-worker event inside the request window can be linked even
   when the identifying observation was captured after `audit_at`. Its state is
@@ -97,16 +135,18 @@ anonymized analytics record, and retained audit record.
   `account_3866` for `case_27`; the matching pre-audit service export reports
   the account absent.
 - **Expected-output account mismatches remain:** The sample comparison reports
-  one extra account ID and eight expected IDs not predicted. Several of the
-  missing accounts are in candidate groups shared by multiple requests; the
-  available status/time evidence does not identify which user owns which
-  resource. The remaining extra (`account_6523` for `case_17`) has a direct
-  historical identifier match, but its deletion activity is outside the
-  request window. These conflicts should not be "fixed" by positional pairing.
-- **Missing analytics verifications:** The anonymized analytics rows have no
-  remaining email, phone, or user reference. Their deletion activities and
-  evidence bundles overlap multiple eligible sample requests, so the supplied
-  data does not establish a unique user-to-resource association.
+  eight expected account IDs not predicted and no extra IDs. Several missing
+  accounts are in candidate groups shared by multiple requests; the available
+  status/time evidence does not identify which user owns which resource.
+  These cases remain unresolved rather than being "fixed" by positional
+  pairing.
+- **Remaining exact-row mismatches are evidence-limited:** The current mismatch
+  report has 14 non-exact rows: 12 contain missing account or analytics steps
+  whose resource records have no direct owner or are eligible for multiple
+  requests; two retained audit IDs are absent from parsed evidence and
+  `system_activity.csv`. Incomplete or conflicting ownership evidence remains
+  unresolved rather than inferred from timestamps, ordering, or shared-file
+  co-occurrence.
 - **Missing retained audit verifications:** `audit_record_6645` and
   `audit_record_5569` do not appear in parsed evidence observations or
   `system_activity.csv`; there is no source-backed resource to verify for
@@ -116,14 +156,20 @@ anonymized analytics record, and retained audit record.
 - **Sequence score needs step-coverage work:** Since all non-exact sample arrays
   also differ in their step sets, the next improvement is evidence discovery
   and resource coverage, not changing the deterministic sort order.
-- **Evidence citation discrepancy:** One matched sample step has an evidence
-  ID different from the expected answer; citation selection should be reviewed
-  separately from status and step-set evaluation.
+- **Screenshot OCR is conservative, not complete:** The local OCR path now
+  processes all 11 supplied PNGs and extracted 35 resource observations in
+  the current environment; two images contained no confident resource IDs.
+  Evidence IDs, manifest paths, capture timestamps, image names, OCR text,
+  and confidence are retained on observations. Owner matching is limited to
+  identifiers found in the same visual row, and unowned OCR resources are
+  excluded from activity-only linking. OCR additions did not change the 32-case
+  sample metrics; screenshot extraction still needs labeled precision/recall
+  testing before broader association rules are considered.
 
 ## Reproduction
 
 From the repository root:
 
 ```powershell
-python code\main.py --eval
+python code\main.py --eval --mismatch-report
 ```
